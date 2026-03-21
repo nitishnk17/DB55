@@ -1,0 +1,17 @@
+Phase 0 - Setup
+
+So basically what I did in this phase was just get everything up and running before touching any actual database code.
+
+First thing I did was try to build the project and it failed immediately. The monitor code was using rlimit64 and setrlimit64 which are Linux only things and I'm on a Mac so it just doesn't exist here. Had to go into monitor/src/main.rs and wrap the Linux stuff in a cfg block and add a separate macOS version using rlimit and setrlimit. After that the build went through fine.
+
+Then I extracted the tpch dataset from the tar file. When I unzipped it, it automatically created a scratch folder with all the CSV and schema files already inside scratch/datasets/tpch. Had all 8 tables - customer, orders, lineitem, nation, region, part, partsupp, supplier.
+
+After that I ran the generator on the tpch dataset. What this does is it takes all those CSV files and converts them into binary .bin files that the disk simulator can actually read, creates a sqlite.db that I can use later to generate expected outputs for testing, and spits out all the config JSON files that the monitor needs to wire everything together.
+
+Then I edited monitor_config.json to enable the first query and set it to scan the nation table since it's the smallest one (only 25 rows) so it's good for testing. The default config had both queries disabled and pointing to TableA and TableB which don't even exist.
+
+Finally ran the monitor and the whole thing came alive for the first time. All three processes started up - monitor, disk simulator, and my database. The database loaded all 8 table schemas, read the query, talked to the disk, got the block size (4096), read a block, and got the 64 MB memory limit from the monitor. Everything was communicating correctly over the file descriptors.
+
+Monitor threw a validation error at the end saying "Program did not validate the result" which makes sense because the starter code never actually sends any results back to the monitor. That's literally what I need to implement in the next phases.
+
+Phase 0 done. Pipeline is working, everything talks to each other, ready to start writing the actual database logic now.
