@@ -11,11 +11,12 @@ use crate::{
 
 mod cli;
 mod io_setup;
+mod disk_manager;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
 
-    // Use the ctx to the tables and stats
+    // Use the ctx to access the tables and stats
     let ctx = DbContext::load_from_file(cli_options.get_config_path())?;
     for table_spec in ctx.get_table_specs() {
         println!("Table: {}", table_spec.name);
@@ -29,43 +30,35 @@ fn db_main() -> Result<()> {
         println!();
     }
 
-    // Setups and provides handler to talk with disk and monitor
-    let (disk_in, mut disk_out) = setup_disk_io();
+    // Setup I/O handlers for disk and monitor
+    let (disk_in, disk_out) = setup_disk_io();
     let (monitor_in, mut monitor_out) = setup_monitor_io();
 
-    // Use buffered reader to read lines easier
-    let mut disk_buf_reader = BufReader::new(disk_in);
-    let mut monitor_buf_reader = BufReader::new(monitor_in);
+    // Initialize DiskManager (queries block size automatically)
+    let mut disk_manager = disk_manager::DiskManager::new(disk_in, disk_out)?;
+    println!("block size is {}", disk_manager.block_size);
 
-    // Temporary variable to read a line of input
+    // Use buffered reader for monitor
+    let mut monitor_buf_reader = BufReader::new(monitor_in);
     let mut input_line = String::new();
 
-    // Read query form monitor
+    // Read query from monitor
     monitor_buf_reader.read_line(&mut input_line)?;
     let query: Query = serde_json::from_str(&input_line).unwrap();
     println!("Input query is: {:#?}", query);
 
-    // Interacting with with Disk
-
-    // Get block size
-    disk_out.write_all("get block-size\n".as_bytes())?;
-    disk_out.flush()?;
-
-    input_line.clear();
-    disk_buf_reader.read_line(&mut input_line)?;
-    let block_size: u64 = input_line.trim().parse()?;
-
-    println!("block size is {}", block_size);
-
-    disk_out.write_all("get block 0 1\n".as_bytes())?;
-    disk_out.flush()?;
-
-    let mut buf = vec![0u8; block_size as usize];
-    disk_buf_reader.read_exact(&mut buf)?;
-
+    // --- Day 3 test: read first block of customer table via DiskManager ---
+    let customer_start = disk_manager.get_file_start_block("customer")?;
+    let customer_num_blocks = disk_manager.get_file_num_blocks("customer")?;
     println!(
-        "First few bytes of block 0 contains {:?}",
-        String::from_utf8_lossy(&buf[..50])
+        "Customer table: start_block={}, num_blocks={}",
+        customer_start, customer_num_blocks
+    );
+
+    let block_data = disk_manager.read_blocks(customer_start, 1)?;
+    println!(
+        "First few bytes of customer block: {:?}",
+        String::from_utf8_lossy(&block_data[..100])
     );
 
     // Get memory limit from monitor
