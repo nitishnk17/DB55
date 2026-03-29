@@ -3,14 +3,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::statistics::ColumnStat;
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct ColumnSpec {
     pub column_name: String,
     pub data_type: DataType,
     pub stats: Option<Vec<ColumnStat>>,
 }
 
-#[derive(Deserialize, Serialize, Debug)]
+#[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct TableSpec {
     pub name: String,
     pub file_id: String,
