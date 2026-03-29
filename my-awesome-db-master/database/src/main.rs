@@ -13,6 +13,8 @@ mod cli;
 mod io_setup;
 mod disk_manager;
 mod row;
+mod operator;
+mod table_scanner;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
@@ -48,32 +50,28 @@ fn db_main() -> Result<()> {
     let query: Query = serde_json::from_str(&input_line).unwrap();
     println!("Input query is: {:#?}", query);
 
-    // --- Day 3 test: read first block of customer table via DiskManager ---
-    let customer_start = disk_manager.get_file_start_block("customer")?;
-    let customer_num_blocks = disk_manager.get_file_num_blocks("customer")?;
-    println!(
-        "Customer table: start_block={}, num_blocks={}",
-        customer_start, customer_num_blocks
-    );
-
-    let block_data = disk_manager.read_blocks(customer_start, 1)?;
-    // println!(
-    //     "First few bytes of customer block: {:?}",
-    //     String::from_utf8_lossy(&block_data[..100])
-    // );
-
-    // --- Day 4 test: decode rows from block 0 of customer table ---
+    // --- Day 5 test: full table scan of customer via TableScanner ---
     let customer_table = ctx
         .get_table_specs()
         .iter()
         .find(|t| t.name == "customer")
         .expect("customer table not found in config");
 
-    let rows = row::decode_block(&block_data, &customer_table.column_specs);
-    println!("Decoded {} rows from customer block 0:", rows.len());
-    for (i, r) in rows.iter().enumerate().take(5) {
-        println!("  Row {}: {}", i, r);
+    use crate::operator::Operator;
+    let mut scanner = table_scanner::TableScanner::new(
+        &mut disk_manager,
+        &customer_table.file_id,
+        customer_table.column_specs.clone(),
+    );
+
+    let mut count = 0;
+    while let Some(row) = scanner.next() {
+        if count < 5 {
+            println!("  Row {}: {}", count, row);
+        }
+        count += 1;
     }
+    println!("Total customer rows: {}", count);
 
     // Get memory limit from monitor
     input_line.clear();
