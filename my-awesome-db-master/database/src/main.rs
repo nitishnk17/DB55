@@ -12,6 +12,7 @@ use crate::{
 mod cli;
 mod io_setup;
 mod disk_manager;
+mod row;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
@@ -56,10 +57,23 @@ fn db_main() -> Result<()> {
     );
 
     let block_data = disk_manager.read_blocks(customer_start, 1)?;
-    println!(
-        "First few bytes of customer block: {:?}",
-        String::from_utf8_lossy(&block_data[..100])
-    );
+    // println!(
+    //     "First few bytes of customer block: {:?}",
+    //     String::from_utf8_lossy(&block_data[..100])
+    // );
+
+    // --- Day 4 test: decode rows from block 0 of customer table ---
+    let customer_table = ctx
+        .get_table_specs()
+        .iter()
+        .find(|t| t.name == "customer")
+        .expect("customer table not found in config");
+
+    let rows = row::decode_block(&block_data, &customer_table.column_specs);
+    println!("Decoded {} rows from customer block 0:", rows.len());
+    for (i, r) in rows.iter().enumerate().take(5) {
+        println!("  Row {}: {}", i, r);
+    }
 
     // Get memory limit from monitor
     input_line.clear();
