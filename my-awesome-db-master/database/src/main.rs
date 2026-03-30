@@ -15,6 +15,7 @@ mod disk_manager;
 mod row;
 mod operator;
 mod table_scanner;
+mod query_executor;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
@@ -50,44 +51,25 @@ fn db_main() -> Result<()> {
     let query: Query = serde_json::from_str(&input_line).unwrap();
     println!("Input query is: {:#?}", query);
 
-    // --- Day 5 test: full table scan of customer via TableScanner ---
-    let customer_table = ctx
-        .get_table_specs()
-        .iter()
-        .find(|t| t.name == "customer")
-        .expect("customer table not found in config");
-
-    use crate::operator::Operator;
-    let mut scanner = table_scanner::TableScanner::new(
-        &mut disk_manager,
-        &customer_table.file_id,
-        customer_table.column_specs.clone(),
-    );
-
-    let mut count = 0;
-    while let Some(row) = scanner.next() {
-        if count < 5 {
-            println!("  Row {}: {}", count, row);
-        }
-        count += 1;
-    }
-    println!("Total customer rows: {}", count);
-
     // Get memory limit from monitor
     input_line.clear();
-    monitor_out.write_all("get_memory_limit\n".as_bytes())?;
+    monitor_out.write_all(b"get_memory_limit\n")?;
     monitor_out.flush()?;
     monitor_buf_reader.read_line(&mut input_line)?;
     let memory_limit_mb: u32 = input_line.trim().parse()?;
     println!("Memory limit is set to {} MB", memory_limit_mb);
 
-    // Send result of query to monitor for validation
-    /*
-    monitor_out.write_all("validate\n".as_bytes())?;
-    monitor_out.write_all("1|hello|DBMS|\n".as_bytes())?;
-    monitor_out.write_all("!\n".as_bytes())?;
+    // Build operator tree from query AST
+    use crate::operator::Operator;
+    let mut root_op = query_executor::build_operator(&query.root, &ctx, &mut disk_manager);
+
+    // Send results to monitor for validation
+    monitor_out.write_all(b"validate\n")?;
+    while let Some(row) = root_op.next() {
+        monitor_out.write_all(format!("{}\n", row).as_bytes())?;
+    }
+    monitor_out.write_all(b"!\n")?;
     monitor_out.flush()?;
-    */
 
     Ok(())
 }
