@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use db_config::table::ColumnSpec;
-use crate::disk_manager::DiskManager;
+use crate::buffer_pool::BufferPool;
 use crate::row::{Row, decode_block};
 use crate::operator::Operator;
 
@@ -13,30 +13,28 @@ pub struct TableScanner {
 
 impl TableScanner {
     pub fn new(
-        disk_manager: &mut DiskManager<impl Read, impl Write>,
+        buffer_pool: &mut BufferPool<impl Read, impl Write>,
         file_id: &str,
         column_specs: Vec<ColumnSpec>,
     ) -> Self {
-        // 1. Query disk for start block and number of blocks
-        let start_block = disk_manager.get_file_start_block(file_id).unwrap();
-        let num_blocks = disk_manager.get_file_num_blocks(file_id).unwrap();
+        // 1. Query metadata through buffer pool
+        let start_block = buffer_pool.get_file_start_block(file_id);
+        let num_blocks = buffer_pool.get_file_num_blocks(file_id);
+        let _block_size = buffer_pool.block_size();
 
-        // 2. Read ALL blocks at once
-        let all_block_data = disk_manager.read_blocks(start_block, num_blocks).unwrap();
-        let block_size = disk_manager.block_size as usize;
-
-        // 3. Decode each block and collect all rows
+        // 2. Fetch each block through the buffer pool and decode rows
         let mut all_rows = Vec::new();
-        for i in 0..num_blocks as usize {
-            let block_start = i * block_size;
-            let block_end = block_start + block_size;
-            let block_slice = &all_block_data[block_start..block_end];
-            let rows = decode_block(block_slice, &column_specs);
+        for i in 0..num_blocks {
+            let block_data = buffer_pool.fetch_block(start_block + i);
+            let rows = decode_block(&block_data, &column_specs);
             all_rows.extend(rows);
+            // Unpin after decoding — we've copied the rows out
+            buffer_pool.unpin(start_block + i);
         }
 
-        // 4. Extract column names for schema()
-        let column_names = column_specs.iter()
+        // 3. Extract column names for schema()
+        let column_names = column_specs
+            .iter()
             .map(|c| c.column_name.clone())
             .collect();
 

@@ -2,11 +2,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use common::query::Query;
 use db_config::DbContext;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 
 use crate::{
     cli::CliOptions,
     io_setup::{setup_disk_io, setup_monitor_io},
+    operator::Operator,
 };
 
 mod cli;
@@ -16,6 +17,7 @@ mod row;
 mod operator;
 mod table_scanner;
 mod query_executor;
+mod buffer_pool;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();
@@ -39,7 +41,7 @@ fn db_main() -> Result<()> {
     let (monitor_in, mut monitor_out) = setup_monitor_io();
 
     // Initialize DiskManager (queries block size automatically)
-    let mut disk_manager = disk_manager::DiskManager::new(disk_in, disk_out)?;
+    let disk_manager = disk_manager::DiskManager::new(disk_in, disk_out)?;
     println!("block size is {}", disk_manager.block_size);
 
     // Use buffered reader for monitor
@@ -59,9 +61,14 @@ fn db_main() -> Result<()> {
     let memory_limit_mb: u32 = input_line.trim().parse()?;
     println!("Memory limit is set to {} MB", memory_limit_mb);
 
+    // Create BufferPool (takes ownership of DiskManager)
+    let block_size = disk_manager.block_size as usize;
+    let num_frames = (memory_limit_mb as usize * 1024 * 1024) / block_size;
+    println!("Buffer pool: {} frames of {} bytes", num_frames, block_size);
+    let mut buffer_pool = buffer_pool::BufferPool::new(num_frames, disk_manager);
+
     // Build operator tree from query AST
-    use crate::operator::Operator;
-    let mut root_op = query_executor::build_operator(&query.root, &ctx, &mut disk_manager);
+    let mut root_op = query_executor::build_operator(&query.root, &ctx, &mut buffer_pool);
 
     // Send results to monitor for validation
     monitor_out.write_all(b"validate\n")?;
