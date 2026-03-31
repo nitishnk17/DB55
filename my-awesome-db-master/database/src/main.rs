@@ -18,6 +18,7 @@ mod operator;
 mod table_scanner;
 mod query_executor;
 mod buffer_pool;
+mod filter;
 
 fn db_main() -> Result<()> {
     let cli_options = CliOptions::parse();

@@ -1,6 +1,7 @@
 use common::query::QueryOp;
 use crate::operator::Operator;
 use crate::table_scanner::TableScanner;
+use crate::filter::FilterOp;
 use crate::buffer_pool::BufferPool;
 use db_config::DbContext;
 use std::io::{Read, Write};
@@ -20,6 +21,12 @@ pub fn build_operator(
                 &table_spec.file_id,
                 table_spec.column_specs.clone(),
             ))
+        }
+        QueryOp::Filter(filter_data) => {
+            // Recursively build the child operator first
+            let child = build_operator(&filter_data.underlying, ctx, buffer_pool);
+            // Wrap it with FilterOp
+            Box::new(FilterOp::new(child, filter_data.predicates.clone()))
         }
         _ => panic!("Operator not yet implemented"),
     }
