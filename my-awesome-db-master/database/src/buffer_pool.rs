@@ -132,4 +132,14 @@ impl<R: Read, W: Write> BufferPool<R, W> {
     pub fn block_size(&self) -> usize {
         self.block_size
     }
+
+    pub fn get_anon_start_block(&mut self) -> u64 {
+        self.disk_manager.get_anon_start_block().unwrap()
+    }
+
+    /// Write a block directly to disk (bypassing the cache).
+    /// Used for writing sorted runs to the anonymous region.
+    pub fn write_block(&mut self, block_id: u64, data: &[u8]) {
+        self.disk_manager.write_blocks(block_id, data).unwrap();
+    }
 }

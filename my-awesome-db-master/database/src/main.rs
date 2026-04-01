@@ -20,6 +20,7 @@ mod operator;
 mod project;
 mod query_executor;
 mod row;
+mod sort;
 mod table_scanner;
 
 fn db_main() -> Result<()> {

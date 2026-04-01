@@ -50,7 +50,7 @@ pub struct CrossData {
     pub right: Box<QueryOp>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct SortSpec {
     pub column_name: String,
     pub ascending: bool,
