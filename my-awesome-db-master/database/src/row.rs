@@ -49,12 +49,25 @@ impl std::fmt::Display for Row {
             match value {
                 Data::Int32(v) => write!(f, "{}|", v)?,
                 Data::Int64(v) => write!(f, "{}|", v)?,
-                Data::Float32(v) => write!(f, "{}|", v)?,
-                Data::Float64(v) => write!(f, "{}|", v)?,
+                Data::Float32(v) => write!(f, "{}|", format_float(*v as f64))?,
+                Data::Float64(v) => write!(f, "{}|", format_float(*v))?,
                 Data::String(v) => write!(f, "{}|", v)?,
             }
         }
         Ok(())
+    }
+}
+
+/// Format a float to match SQLite output.
+/// SQLite's default: strips trailing zeros but always keeps ".0" for integer-valued floats.
+/// Rust's default `{}`: strips trailing zeros AND the decimal point (17.0 → "17").
+fn format_float(v: f64) -> String {
+    if v.is_finite() && v == v.trunc() {
+        // Integer-valued float: SQLite shows "NNN.0"
+        format!("{:.1}", v)
+    } else {
+        // Non-integer or special: Rust's default matches SQLite
+        format!("{}", v)
     }
 }
 
@@ -80,5 +93,19 @@ pub fn decode_block(block_data: &[u8], schema: &[ColumnSpec]) -> Vec<Row> {
     rows    
 }
 
-
-    
+pub fn encode_row(row: &Row) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for value in &row.values {
+        match value {
+            Data::Int32(v) => bytes.extend_from_slice(&v.to_le_bytes()),
+            Data::Int64(v) => bytes.extend_from_slice(&v.to_le_bytes()),
+            Data::Float32(v) => bytes.extend_from_slice(&v.to_le_bytes()),
+            Data::Float64(v) => bytes.extend_from_slice(&v.to_le_bytes()),
+            Data::String(v) => {
+                bytes.extend_from_slice(v.as_bytes());
+                bytes.push(0x00);
+            }
+        }
+    }
+    bytes
+}
