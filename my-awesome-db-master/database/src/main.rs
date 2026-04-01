@@ -12,6 +12,7 @@ use crate::{
 
 mod buffer_pool;
 mod cli;
+mod cross;
 mod disk_manager;
 mod filter;
 mod io_setup;
