@@ -12,6 +12,7 @@ use crate::{
 
 mod buffer_pool;
 mod cli;
+mod cross;
 mod disk_manager;
 mod filter;
 mod io_setup;
@@ -19,6 +20,7 @@ mod operator;
 mod project;
 mod query_executor;
 mod row;
+mod sort;
 mod table_scanner;
 
 fn db_main() -> Result<()> {
