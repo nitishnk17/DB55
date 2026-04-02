@@ -29,9 +29,61 @@ pub fn build_operator(
             ))
         }
         QueryOp::Filter(filter_data) => {
-            // Recursively build the child operator first
+            // Check for potential Block Nested Loop Join pattern
+            if let QueryOp::Cross(cross_data) = &*filter_data.underlying {
+                let mut join_pred_idx = None;
+                for (i, p) in filter_data.predicates.iter().enumerate() {
+                    if let common::query::ComparisionOperator::EQ = p.operator {
+                        if let common::query::ComparisionValue::Column(col_b) = &p.value {
+                            join_pred_idx = Some((i, p.column_name.clone(), col_b.clone()));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((idx, col_a, col_b)) = join_pred_idx {
+                    // Valid equi-join detected! Let's instantiate JoinOp.
+                    let left = build_operator(&cross_data.left, ctx, buffer_pool);
+                    let right_op = build_operator(&cross_data.right, ctx, buffer_pool);
+
+                    let left_schema = left.schema();
+                    let right_schema = right_op.schema();
+
+                    let (left_col_idx, right_col_idx) =
+                        if let Some(l_idx) = left_schema.iter().position(|x| *x == col_a) {
+                            let r_idx = right_schema.iter().position(|x| *x == col_b).unwrap();
+                            (l_idx, r_idx)
+                        } else if let Some(l_idx) = left_schema.iter().position(|x| *x == col_b) {
+                            let r_idx = right_schema.iter().position(|x| *x == col_a).unwrap();
+                            (l_idx, r_idx)
+                        } else {
+                            panic!("Join columns not found in left schema");
+                        };
+
+                    let right_column_specs = resolve_column_specs(&right_schema, ctx);
+                    let join_op = Box::new(crate::join::JoinOp::new(
+                        left,
+                        right_op,
+                        left_col_idx,
+                        right_col_idx,
+                        right_column_specs,
+                        buffer_pool,
+                    ));
+
+                    // Push remaining conditions into a standard FilterOp Above
+                    let mut remaining_preds = filter_data.predicates.clone();
+                    remaining_preds.remove(idx);
+
+                    if remaining_preds.is_empty() {
+                        return join_op;
+                    } else {
+                        return Box::new(FilterOp::new(join_op, remaining_preds));
+                    }
+                }
+            }
+
+            // Standard fallback Filter
             let child = build_operator(&filter_data.underlying, ctx, buffer_pool);
-            // Wrap it with FilterOp
             Box::new(FilterOp::new(child, filter_data.predicates.clone()))
         }
         QueryOp::Project(project_data) => {
