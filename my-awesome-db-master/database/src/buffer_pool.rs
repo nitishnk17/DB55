@@ -68,13 +68,14 @@ impl<R: Read, W: Write> BufferPool<R, W> {
     }
 
     pub fn unpin(&mut self, block_id: u64) {
-        if let Some(&frame_idx) = self.page_table.get(&block_id) {
-            if self.frames[frame_idx].pin_count > 0 {
-                self.frames[frame_idx].pin_count -= 1;
-            }
+        if let Some(&frame_idx) = self.page_table.get(&block_id)
+            && self.frames[frame_idx].pin_count > 0
+        {
+            self.frames[frame_idx].pin_count -= 1;
         }
     }
 
+    #[allow(dead_code)]
     pub fn mark_dirty(&mut self, block_id: u64) {
         if let Some(&frame_idx) = self.page_table.get(&block_id) {
             self.frames[frame_idx].dirty = true;

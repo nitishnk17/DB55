@@ -7,7 +7,6 @@ use std::io::{BufRead, BufReader, Write};
 use crate::{
     cli::CliOptions,
     io_setup::{setup_disk_io, setup_monitor_io},
-    operator::Operator,
 };
 
 mod buffer_pool;

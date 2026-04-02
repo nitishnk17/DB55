@@ -5,7 +5,6 @@ use crate::row::{Row, decode_block};
 use crate::operator::Operator;
 
 pub struct TableScanner {
-    column_specs: Vec<ColumnSpec>,
     column_names: Vec<String>,
     all_rows: Vec<Row>,
     current_index: usize,
@@ -39,7 +38,6 @@ impl TableScanner {
             .collect();
 
         TableScanner {
-            column_specs,
             column_names,
             all_rows,
             current_index: 0,
