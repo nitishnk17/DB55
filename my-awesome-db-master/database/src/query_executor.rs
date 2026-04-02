@@ -21,7 +21,7 @@ pub fn build_operator(
                 .get_table_specs()
                 .iter()
                 .find(|t| t.name == scan_data.table_id)
-                .expect(&format!("Table '{}' not found", scan_data.table_id));
+                .unwrap_or_else(|| panic!("Table '{}' not found", scan_data.table_id));
             Box::new(TableScanner::new(
                 buffer_pool,
                 &table_spec.file_id,

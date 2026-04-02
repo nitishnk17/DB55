@@ -125,10 +125,15 @@ impl SortOp {
             }
         }
 
-        eprintln!("External sort: created {} runs", runs.len());
-
-        // K-way merge
-        let sorted_rows = merge_runs(&runs, &sort_keys, &column_specs, buffer_pool);
+        // Multi-pass K-way merge controller
+        let sorted_rows = merge_all_runs(
+            runs,
+            &sort_keys,
+            &column_specs,
+            buffer_pool,
+            &mut allocator,
+            block_size,
+        );
 
         SortOp {
             sorted_rows,
@@ -199,6 +204,7 @@ impl AnonBlockAllocator {
 
 // ─── Run Management ──────────────────────────────────────────────────────
 
+#[derive(Clone)]
 struct Run {
     start_block: u64,
     num_blocks: u64,
@@ -325,7 +331,125 @@ impl Ord for HeapEntry {
 
 // ─── K-Way Merge ─────────────────────────────────────────────────────────
 
-fn merge_runs(
+fn merge_all_runs(
+    mut runs: Vec<Run>,
+    sort_keys: &[(usize, bool)],
+    column_specs: &[ColumnSpec],
+    buffer_pool: &mut BufferPool<impl Read, impl Write>,
+    allocator: &mut AnonBlockAllocator,
+    block_size: usize,
+) -> Vec<Row> {
+    // 128 is a conservative fanout for typical systems
+    // In our tests, memory easily fits this without buffer pool contention
+    let max_fanout = 128;
+
+    while runs.len() > max_fanout {
+        let mut next_pass_runs = Vec::new();
+
+        for chunk in runs.chunks(max_fanout) {
+            if chunk.len() == 1 {
+                // Just carry the remaining run over if alone
+                next_pass_runs.push(chunk[0].clone());
+            } else {
+                let merged_run = merge_k_runs_to_disk(
+                    chunk,
+                    sort_keys,
+                    column_specs,
+                    buffer_pool,
+                    allocator,
+                    block_size,
+                );
+                next_pass_runs.push(merged_run);
+            }
+        }
+        runs = next_pass_runs;
+    }
+
+    merge_k_runs_to_vec(&runs, sort_keys, column_specs, buffer_pool)
+}
+
+fn merge_k_runs_to_disk(
+    runs: &[Run],
+    sort_keys: &[(usize, bool)],
+    column_specs: &[ColumnSpec],
+    buffer_pool: &mut BufferPool<impl Read, impl Write>,
+    allocator: &mut AnonBlockAllocator,
+    block_size: usize,
+) -> Run {
+    let mut readers: Vec<RunReader> = runs
+        .iter()
+        .map(|run| RunReader::new(run, column_specs.to_vec(), buffer_pool))
+        .collect();
+
+    let mut heap = BinaryHeap::new();
+    for (i, reader) in readers.iter().enumerate() {
+        if let Some(row) = reader.peek() {
+            heap.push(HeapEntry {
+                row: row.clone(),
+                run_index: i,
+                sort_keys: sort_keys.to_vec(),
+            });
+        }
+    }
+
+    let mut current_block = vec![0u8; block_size];
+    let usable_space = block_size - 2;
+    let mut offset = 0;
+    let mut row_count_in_blk: u16 = 0;
+
+    let start_block = allocator.allocate(0); // Peeking the next block ID
+    let mut num_blocks = 0;
+    let mut total_rows = 0;
+
+    while let Some(entry) = heap.pop() {
+        // Encode and write row buffer to disk
+        let encoded = encode_row(&entry.row);
+        if offset + encoded.len() > usable_space {
+            current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
+            
+            let blk = allocator.allocate(1);
+            buffer_pool.write_block(blk, &current_block);
+            num_blocks += 1;
+
+            current_block = vec![0u8; block_size];
+            offset = 0;
+            row_count_in_blk = 0;
+        }
+
+        current_block[offset..offset + encoded.len()].copy_from_slice(&encoded);
+        offset += encoded.len();
+        row_count_in_blk += 1;
+        total_rows += 1;
+
+        // Advance reader
+        let reader = &mut readers[entry.run_index];
+        reader.advance(buffer_pool);
+
+        if let Some(next_row) = reader.peek() {
+            heap.push(HeapEntry {
+                row: next_row.clone(),
+                run_index: entry.run_index,
+                sort_keys: sort_keys.to_vec(),
+            });
+        }
+    }
+
+    // Flush last block
+    if row_count_in_blk > 0 {
+        current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
+        let blk = allocator.allocate(1);
+        buffer_pool.write_block(blk, &current_block);
+        num_blocks += 1;
+    }
+
+    Run {
+        start_block,
+        num_blocks,
+        num_rows: total_rows,
+    }
+}
+
+fn merge_k_runs_to_vec(
     runs: &[Run],
     sort_keys: &[(usize, bool)],
     column_specs: &[ColumnSpec],
