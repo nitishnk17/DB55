@@ -15,6 +15,7 @@ mod cross;
 mod disk_manager;
 mod disk_run;
 mod filter;
+mod hash_join;
 mod io_setup;
 mod join;
 mod operator;
