@@ -125,8 +125,6 @@ impl SortOp {
             }
         }
 
-        eprintln!("External sort: created {} runs", runs.len());
-
         // Multi-pass K-way merge controller
         let sorted_rows = merge_all_runs(
             runs,
@@ -347,8 +345,6 @@ fn merge_all_runs(
 
     while runs.len() > max_fanout {
         let mut next_pass_runs = Vec::new();
-        
-        eprintln!("External sort: running intermediate pass with {} runs", runs.len());
 
         for chunk in runs.chunks(max_fanout) {
             if chunk.len() == 1 {
@@ -369,7 +365,6 @@ fn merge_all_runs(
         runs = next_pass_runs;
     }
 
-    eprintln!("External sort: final merge pass with {} runs", runs.len());
     merge_k_runs_to_vec(&runs, sort_keys, column_specs, buffer_pool)
 }
 
@@ -403,7 +398,6 @@ fn merge_k_runs_to_disk(
     let mut row_count_in_blk: u16 = 0;
 
     let start_block = allocator.allocate(0); // Peeking the next block ID
-    let mut current_block_id = start_block;
     let mut num_blocks = 0;
     let mut total_rows = 0;
 
@@ -415,7 +409,6 @@ fn merge_k_runs_to_disk(
             
             let blk = allocator.allocate(1);
             buffer_pool.write_block(blk, &current_block);
-            current_block_id = blk;
             num_blocks += 1;
 
             current_block = vec![0u8; block_size];
