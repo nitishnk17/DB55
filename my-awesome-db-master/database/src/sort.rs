@@ -5,8 +5,9 @@ use common::query::SortSpec;
 use common::DataType;
 use db_config::table::ColumnSpec;
 use crate::buffer_pool::BufferPool;
+use crate::disk_run::{rows_to_blocks, Run, RunReader};
 use crate::operator::Operator;
-use crate::row::{Row, decode_block, encode_row};
+use crate::row::{encode_row, Row};
 
 // ─── SortOp ─────────────────────────────────────────────────────────────
 
@@ -87,10 +88,6 @@ impl SortOp {
             memory_budget_rows
         );
 
-        let anon_start = buffer_pool.get_anon_start_block();
-        let mut allocator = AnonBlockAllocator::new(anon_start);
-
-        // Create sorted runs — first run from rows already collected
         let mut runs = Vec::new();
 
         // Process the rows we already have as the first (partial) run,
@@ -102,7 +99,7 @@ impl SortOp {
             // Serialize and write to anonymous blocks
             let blocks = rows_to_blocks(&all_rows, block_size);
             let num_blocks = blocks.len() as u64;
-            let start_block = allocator.allocate(num_blocks);
+            let start_block = buffer_pool.allocate_anon_blocks(num_blocks);
             for (i, block_data) in blocks.iter().enumerate() {
                 buffer_pool.write_block(start_block + i as u64, block_data);
             }
@@ -131,7 +128,6 @@ impl SortOp {
             &sort_keys,
             &column_specs,
             buffer_pool,
-            &mut allocator,
             block_size,
         );
 
@@ -182,124 +178,7 @@ fn estimate_memory_budget(block_size: usize, column_specs: &[ColumnSpec]) -> usi
     std::cmp::max(available_memory / effective_row_size, 100)
 }
 
-// ─── Anonymous Block Allocator ───────────────────────────────────────────
-
-struct AnonBlockAllocator {
-    next_block_id: u64,
-}
-
-impl AnonBlockAllocator {
-    fn new(anon_start_block: u64) -> Self {
-        AnonBlockAllocator {
-            next_block_id: anon_start_block,
-        }
-    }
-
-    fn allocate(&mut self, num_blocks: u64) -> u64 {
-        let start = self.next_block_id;
-        self.next_block_id += num_blocks;
-        start
-    }
-}
-
-// ─── Run Management ──────────────────────────────────────────────────────
-
-#[derive(Clone)]
-struct Run {
-    start_block: u64,
-    num_blocks: u64,
-    num_rows: usize,
-}
-
-/// Convert rows into block-formatted byte buffers ready for disk writes.
-fn rows_to_blocks(rows: &[Row], block_size: usize) -> Vec<Vec<u8>> {
-    let usable_space = block_size - 2;
-    let mut blocks = Vec::new();
-    let mut current_block = vec![0u8; block_size];
-    let mut offset = 0;
-    let mut row_count: u16 = 0;
-
-    for row in rows {
-        let encoded = encode_row(row);
-
-        if offset + encoded.len() > usable_space {
-            // Finalize current block
-            current_block[block_size - 2..].copy_from_slice(&row_count.to_le_bytes());
-            blocks.push(current_block);
-            current_block = vec![0u8; block_size];
-            offset = 0;
-            row_count = 0;
-        }
-
-        current_block[offset..offset + encoded.len()].copy_from_slice(&encoded);
-        offset += encoded.len();
-        row_count += 1;
-    }
-
-    if row_count > 0 {
-        current_block[block_size - 2..].copy_from_slice(&row_count.to_le_bytes());
-        blocks.push(current_block);
-    }
-
-    blocks
-}
-
-// ─── Run Reader ──────────────────────────────────────────────────────────
-
-struct RunReader {
-    start_block: u64,
-    num_blocks: u64,
-    current_block_idx: u64,
-    current_row_idx: usize,
-    current_block_rows: Vec<Row>,
-    schema: Vec<ColumnSpec>,
-    exhausted: bool,
-}
-
-impl RunReader {
-    fn new(
-        run: &Run,
-        schema: Vec<ColumnSpec>,
-        buffer_pool: &mut BufferPool<impl Read, impl Write>,
-    ) -> Self {
-        let block_data = buffer_pool.fetch_block(run.start_block);
-        buffer_pool.unpin(run.start_block);
-        let rows = decode_block(&block_data, &schema);
-
-        RunReader {
-            start_block: run.start_block,
-            num_blocks: run.num_blocks,
-            current_block_idx: 0,
-            current_row_idx: 0,
-            current_block_rows: rows,
-            schema,
-            exhausted: run.num_rows == 0,
-        }
-    }
-
-    fn peek(&self) -> Option<&Row> {
-        if self.exhausted {
-            return None;
-        }
-        self.current_block_rows.get(self.current_row_idx)
-    }
-
-    fn advance(&mut self, buffer_pool: &mut BufferPool<impl Read, impl Write>) {
-        self.current_row_idx += 1;
-        if self.current_row_idx >= self.current_block_rows.len() {
-            self.current_block_idx += 1;
-            if self.current_block_idx >= self.num_blocks {
-                self.exhausted = true;
-                return;
-            }
-            let block_id = self.start_block + self.current_block_idx;
-            let block_data = buffer_pool.fetch_block(block_id);
-            buffer_pool.unpin(block_id);
-            self.current_block_rows = decode_block(&block_data, &self.schema);
-            self.current_row_idx = 0;
-        }
-    }
-}
+// Components moved to disk_run.rs
 
 // ─── Heap Entry (min-heap via reversed Ord) ──────────────────────────────
 
@@ -336,7 +215,6 @@ fn merge_all_runs(
     sort_keys: &[(usize, bool)],
     column_specs: &[ColumnSpec],
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
-    allocator: &mut AnonBlockAllocator,
     block_size: usize,
 ) -> Vec<Row> {
     // 128 is a conservative fanout for typical systems
@@ -356,7 +234,6 @@ fn merge_all_runs(
                     sort_keys,
                     column_specs,
                     buffer_pool,
-                    allocator,
                     block_size,
                 );
                 next_pass_runs.push(merged_run);
@@ -373,7 +250,6 @@ fn merge_k_runs_to_disk(
     sort_keys: &[(usize, bool)],
     column_specs: &[ColumnSpec],
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
-    allocator: &mut AnonBlockAllocator,
     block_size: usize,
 ) -> Run {
     let mut readers: Vec<RunReader> = runs
@@ -397,7 +273,7 @@ fn merge_k_runs_to_disk(
     let mut offset = 0;
     let mut row_count_in_blk: u16 = 0;
 
-    let start_block = allocator.allocate(0); // Peeking the next block ID
+    let start_block = buffer_pool.allocate_anon_blocks(0); // Peeking the next block ID
     let mut num_blocks = 0;
     let mut total_rows = 0;
 
@@ -407,7 +283,7 @@ fn merge_k_runs_to_disk(
         if offset + encoded.len() > usable_space {
             current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
             
-            let blk = allocator.allocate(1);
+            let blk = buffer_pool.allocate_anon_blocks(1);
             buffer_pool.write_block(blk, &current_block);
             num_blocks += 1;
 
@@ -434,10 +310,9 @@ fn merge_k_runs_to_disk(
         }
     }
 
-    // Flush last block
     if row_count_in_blk > 0 {
         current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
-        let blk = allocator.allocate(1);
+        let blk = buffer_pool.allocate_anon_blocks(1);
         buffer_pool.write_block(blk, &current_block);
         num_blocks += 1;
     }

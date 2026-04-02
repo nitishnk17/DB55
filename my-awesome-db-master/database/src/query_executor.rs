@@ -1,11 +1,13 @@
 use crate::buffer_pool::BufferPool;
 use crate::cross::CrossOp;
 use crate::filter::FilterOp;
+use crate::hash_join::HashJoinOp;
 use crate::operator::Operator;
 use crate::project::ProjectOp;
 use crate::sort::SortOp;
 use crate::table_scanner::TableScanner;
 use common::query::QueryOp;
+use db_config::statistics::{CardinalityData, ColumnStat};
 use db_config::table::ColumnSpec;
 use db_config::DbContext;
 use std::io::{Read, Write};
@@ -29,9 +31,80 @@ pub fn build_operator(
             ))
         }
         QueryOp::Filter(filter_data) => {
-            // Recursively build the child operator first
+            // Check for potential Block Nested Loop Join pattern
+            if let QueryOp::Cross(cross_data) = &*filter_data.underlying {
+                let mut join_pred_idx = None;
+                for (i, p) in filter_data.predicates.iter().enumerate() {
+                    if let common::query::ComparisionOperator::EQ = p.operator {
+                        if let common::query::ComparisionValue::Column(col_b) = &p.value {
+                            join_pred_idx = Some((i, p.column_name.clone(), col_b.clone()));
+                            break;
+                        }
+                    }
+                }
+
+                if let Some((idx, col_a, col_b)) = join_pred_idx {
+                    // Valid equi-join detected!
+                    let left = build_operator(&cross_data.left, ctx, buffer_pool);
+                    let right_op = build_operator(&cross_data.right, ctx, buffer_pool);
+
+                    let left_schema = left.schema();
+                    let right_schema = right_op.schema();
+
+                    let (left_col_idx, right_col_idx) =
+                        if let Some(l_idx) = left_schema.iter().position(|x| *x == col_a) {
+                            let r_idx = right_schema.iter().position(|x| *x == col_b).unwrap();
+                            (l_idx, r_idx)
+                        } else if let Some(l_idx) = left_schema.iter().position(|x| *x == col_b) {
+                            let r_idx = right_schema.iter().position(|x| *x == col_a).unwrap();
+                            (l_idx, r_idx)
+                        } else {
+                            panic!("Join columns not found in left schema");
+                        };
+
+                    let left_column_specs = resolve_column_specs(&left_schema, ctx);
+                    let right_column_specs = resolve_column_specs(&right_schema, ctx);
+
+                    // Choose join strategy based on estimated table cardinality
+                    let use_hash_join = should_use_hash_join(&left_schema, &right_schema, ctx);
+
+                    let join_op: Box<dyn Operator> = if use_hash_join {
+                        eprintln!("Join strategy: Grace Hash Join");
+                        Box::new(HashJoinOp::new(
+                            left,
+                            right_op,
+                            left_col_idx,
+                            right_col_idx,
+                            left_column_specs,
+                            right_column_specs,
+                            buffer_pool,
+                        ))
+                    } else {
+                        eprintln!("Join strategy: Block Nested Loop Join");
+                        Box::new(crate::join::JoinOp::new(
+                            left,
+                            right_op,
+                            left_col_idx,
+                            right_col_idx,
+                            right_column_specs,
+                            buffer_pool,
+                        ))
+                    };
+
+                    // Push remaining conditions into a standard FilterOp above
+                    let mut remaining_preds = filter_data.predicates.clone();
+                    remaining_preds.remove(idx);
+
+                    if remaining_preds.is_empty() {
+                        return join_op;
+                    } else {
+                        return Box::new(FilterOp::new(join_op, remaining_preds));
+                    }
+                }
+            }
+
+            // Standard fallback Filter
             let child = build_operator(&filter_data.underlying, ctx, buffer_pool);
-            // Wrap it with FilterOp
             Box::new(FilterOp::new(child, filter_data.predicates.clone()))
         }
         QueryOp::Project(project_data) => {
@@ -75,4 +148,47 @@ fn resolve_column_specs(schema: &[String], ctx: &DbContext) -> Vec<ColumnSpec> {
             panic!("Column '{}' not found in any table", col_name);
         })
         .collect()
+}
+
+/// Heuristic to decide whether to use Grace Hash Join or BNLJ.
+/// Uses CardinalityStat if available; defaults to hash join for safety.
+fn should_use_hash_join(left_schema: &[String], right_schema: &[String], ctx: &DbContext) -> bool {
+    let threshold = 1000u64;
+
+    // Try to find cardinality stats for columns in each side
+    let left_card = estimate_cardinality(left_schema, ctx);
+    let right_card = estimate_cardinality(right_schema, ctx);
+
+    match (left_card, right_card) {
+        (Some(l), Some(r)) => {
+            eprintln!("Join heuristic: left_card={}, right_card={}, threshold={}", l, r, threshold);
+            l > threshold || r > threshold
+        }
+        _ => {
+            // No stats available — default to hash join (safer for unknown sizes)
+            eprintln!("Join heuristic: no cardinality stats, defaulting to hash join");
+            true
+        }
+    }
+}
+
+/// Look up the CardinalityStat for any column belonging to a schema.
+/// Returns the first cardinality found (all columns in a table share similar values).
+fn estimate_cardinality(schema: &[String], ctx: &DbContext) -> Option<u64> {
+    for col_name in schema {
+        for table in ctx.get_table_specs() {
+            for cs in &table.column_specs {
+                if cs.column_name == *col_name {
+                    if let Some(stats) = &cs.stats {
+                        for stat in stats {
+                            if let ColumnStat::CardinalityStat(CardinalityData(card)) = stat {
+                                return Some(*card);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    None
 }

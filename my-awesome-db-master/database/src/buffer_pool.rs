@@ -15,6 +15,7 @@ pub struct BufferPool<R: Read, W: Write> {
     lru_list: VecDeque<usize>,
     disk_manager: DiskManager<R, W>,
     block_size: usize,
+    next_anon_block_id: Option<u64>,
 }
 
 impl<R: Read, W: Write> BufferPool<R, W> {
@@ -35,8 +36,20 @@ impl<R: Read, W: Write> BufferPool<R, W> {
             lru_list: VecDeque::new(),
             disk_manager,
             block_size,
+            next_anon_block_id: None,
         }
     }
+
+    pub fn allocate_anon_blocks(&mut self, num_blocks: u64) -> u64 {
+        if self.next_anon_block_id.is_none() {
+            self.next_anon_block_id = Some(self.disk_manager.get_anon_start_block().unwrap());
+        }
+        let start = self.next_anon_block_id.unwrap();
+        self.next_anon_block_id = Some(start + num_blocks);
+        start
+    }
+
+
 
     /// Fetch a block by ID. Returns a clone of the block data.
     /// If cached, returns from cache. Otherwise reads from disk.
