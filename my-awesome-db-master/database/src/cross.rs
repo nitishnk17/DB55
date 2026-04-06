@@ -23,6 +23,7 @@ impl CrossOp {
         while let Some(row) = right.next() {
             right_rows.push(row);
         }
+        eprintln!("CrossOp: materialized {} right rows", right_rows.len());
 
         // 3. Get the first left row
         let current_left_row = left.next();

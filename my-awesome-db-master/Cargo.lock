@@ -148,6 +148,7 @@ dependencies = [
  "common",
  "db_config",
  "fd_wrapper",
+ "libc",
  "serde",
  "serde_json",
 ]

@@ -57,22 +57,14 @@ impl std::fmt::Display for Row {
         Ok(())
     }
 }
-
 /// Format a float to match the TPC-H expected output.
 ///
-/// Every float column in TPC-H is DECIMAL(15,2) — exactly 2 decimal places.
-/// The expected CSV files were produced by the TPC-H dbgen tool, which uses
-/// printf("%.2f", ...).  A value stored as 4192.4 (f64) must therefore be
-/// printed as "4192.40", not "4192.4".
-///
-/// Rust's default `{}` uses shortest-roundtrip notation and strips trailing
-/// zeros, which would cause a validation mismatch and a pipe-buffer deadlock
-/// (monitor stops reading → database blocks on write → neither exits).
-///
-/// Fix: always emit exactly 2 decimal places for every float column.
+/// Strips trailing zeros but keeps at least one decimal place (matches SQLite output)
+/// - 50.0  -> "50.0"
+/// - 19.40 -> "19.4"
+/// - 123.0 -> "123.0"
 fn format_float(v: f64) -> String {
     let s = format!("{:.2}", v);
-    // Strip trailing zeros but keep at least one decimal place (matches SQLite output)
     let s = s.trim_end_matches('0');
     if s.ends_with('.') {
         format!("{}0", s)
