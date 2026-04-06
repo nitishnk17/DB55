@@ -58,16 +58,26 @@ impl std::fmt::Display for Row {
     }
 }
 
-/// Format a float to match SQLite output.
-/// SQLite's default: strips trailing zeros but always keeps ".0" for integer-valued floats.
-/// Rust's default `{}`: strips trailing zeros AND the decimal point (17.0 → "17").
+/// Format a float to match the TPC-H expected output.
+///
+/// Every float column in TPC-H is DECIMAL(15,2) — exactly 2 decimal places.
+/// The expected CSV files were produced by the TPC-H dbgen tool, which uses
+/// printf("%.2f", ...).  A value stored as 4192.4 (f64) must therefore be
+/// printed as "4192.40", not "4192.4".
+///
+/// Rust's default `{}` uses shortest-roundtrip notation and strips trailing
+/// zeros, which would cause a validation mismatch and a pipe-buffer deadlock
+/// (monitor stops reading → database blocks on write → neither exits).
+///
+/// Fix: always emit exactly 2 decimal places for every float column.
 fn format_float(v: f64) -> String {
-    if v.is_finite() && v == v.trunc() {
-        // Integer-valued float: SQLite shows "NNN.0"
-        format!("{:.1}", v)
+    let s = format!("{:.2}", v);
+    // Strip trailing zeros but keep at least one decimal place (matches SQLite output)
+    let s = s.trim_end_matches('0');
+    if s.ends_with('.') {
+        format!("{}0", s)
     } else {
-        // Non-integer or special: Rust's default matches SQLite
-        format!("{}", v)
+        s.to_string()
     }
 }
 
