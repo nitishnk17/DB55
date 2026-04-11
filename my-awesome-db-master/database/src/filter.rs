@@ -20,8 +20,6 @@ impl FilterOp {
             .enumerate()
             .map(|(i, name)| (name.clone(), i))
             .collect();
-        eprintln!("Filter created for columns: {:?}", col_index_map.keys().collect::<Vec<_>>());
-
         FilterOp {
             child,
             predicates,
@@ -35,7 +33,6 @@ impl Operator for FilterOp {
         // Keep pulling rows from child until one passes all predicates
         while let Some(row) = self.child.next() {
             if evaluate_all_predicates(&self.predicates, &row, &self.col_index_map) {
-                eprintln!("Filter yielding row");
                 return Some(row);
             }
         }
@@ -75,17 +72,14 @@ fn evaluate_predicate(
     col_index_map: &HashMap<String, usize>,
 ) -> bool {
     // Get the left side: the column value from the row
-    let left_idx = match col_index_map.get(&predicate.column_name) {
-        Some(idx) => *idx,
-        None => panic!("Column '{}' not found in schema {:?}", predicate.column_name, col_index_map.keys().collect::<Vec<_>>()),
-    };
+    let left_idx = col_index_map[&predicate.column_name];
     let left = &row.values[left_idx];
 
     // Get the right side: resolve from literal or column reference
     let right = resolve_value(&predicate.value, row, col_index_map);
 
     // Compare using the operator
-    let res = match predicate.operator {
+    match predicate.operator {
         ComparisionOperator::EQ => left == &right,
         ComparisionOperator::NE => left != &right,
         ComparisionOperator::GT => {
@@ -100,11 +94,7 @@ fn evaluate_predicate(
         ComparisionOperator::LTE => {
             matches!(left.partial_cmp(&right), Some(Ordering::Less | Ordering::Equal))
         }
-    };
-    if predicate.column_name == "ps_suppkey" {
-        eprintln!("Filter: ps_suppkey={:?} vs {:?} -> {}", left, right, res);
     }
-    res
 }
 
 /// Evaluate ALL predicates against a row (AND logic). Returns true only if every predicate passes.

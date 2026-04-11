@@ -44,7 +44,7 @@ impl ProjectOp {
 impl Operator for ProjectOp {
     fn next(&mut self) -> Option<Row> {
         // Pull the next row from child
-        let res = self.child.next().map(|row| {
+        self.child.next().map(|row| {
             // Pick only the columns at our pre-computed indices
             let new_values: Vec<_> = self
                 .input_indices
@@ -52,11 +52,7 @@ impl Operator for ProjectOp {
                 .map(|&idx| row.values[idx].clone())
                 .collect();
             Row { values: new_values }
-        });
-        if res.is_some() {
-            eprintln!("Project yielding row");
-        }
-        res
+        })
     }
 
     fn schema(&self) -> Vec<String> {
