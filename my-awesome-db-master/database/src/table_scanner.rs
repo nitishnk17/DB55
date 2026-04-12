@@ -3,18 +3,16 @@ use db_config::table::ColumnSpec;
 use crate::buffer_pool::BufferPool;
 use crate::row::{Row, decode_block};
 use crate::operator::Operator;
-
-/// Number of blocks to read in a single disk call during a sequential scan.
-///
-/// Larger batches mean fewer round-trips to the disk simulator (each of which
-/// incurs seek + rotational-latency overhead), but more peak memory usage.
-/// 128 blocks × 4 KB = 512 KB per batch — reduces round-trips by 4× vs 32.
-const SCAN_BATCH_SIZE: u64 = 128;
+use std::collections::VecDeque;
 
 pub struct TableScanner {
     column_names: Vec<String>,
-    all_rows: Vec<Row>,
-    current_index: usize,
+    column_specs: Vec<ColumnSpec>,
+    file_id: String,
+    start_block: u64,
+    num_blocks: u64,
+    current_block: u64,
+    batch_rows: VecDeque<Row>,
 }
 
 impl TableScanner {
@@ -23,55 +21,9 @@ impl TableScanner {
         file_id: &str,
         column_specs: Vec<ColumnSpec>,
     ) -> Self {
-        // Query file metadata
         let start_block = buffer_pool.get_file_start_block(file_id);
         let num_blocks  = buffer_pool.get_file_num_blocks(file_id);
-        let block_size  = buffer_pool.block_size();
 
-        eprintln!(
-            "TableScanner: '{}' → start_block={}, num_blocks={}",
-            file_id, start_block, num_blocks
-        );
-
-        // ── Batch sequential reads ────────────────────────────────────────
-        //
-        // Instead of fetching one block at a time through the LRU cache (which
-        // would cause sequential flooding for large tables), we issue multi-block
-        // read commands directly.  This:
-        //   1. Reduces the number of disk protocol round-trips from N to N/BATCH.
-        //   2. Avoids polluting the LRU cache with pages that won't be revisited.
-        //
-        // The raw bytes are decoded into Row objects immediately; the byte buffer
-        // is dropped after each batch so memory usage stays at O(batch) not O(N).
-        //
-        // Pre-allocate the row vector with an estimated capacity to avoid
-        // repeated reallocation as we push rows.  We estimate ~60 bytes per
-        // encoded row (conservative for TPC-H tables with several string cols).
-        let estimated_rows = ((num_blocks as usize) * block_size / 60).max(64);
-        let mut all_rows: Vec<Row> = Vec::with_capacity(estimated_rows);
-        let mut block = start_block;
-
-        while block < start_block + num_blocks {
-            let count = SCAN_BATCH_SIZE.min(start_block + num_blocks - block);
-
-            // One disk call for `count` blocks
-            let raw = buffer_pool.read_blocks_sequential(block, count);
-
-            // Decode each block from the raw byte slice
-            for i in 0..count as usize {
-                let begin = i * block_size;
-                let end   = begin + block_size;
-                let block_data = &raw[begin..end];
-                let rows = decode_block(block_data, &column_specs);
-                all_rows.extend(rows);
-            }
-
-            block += count;
-        }
-
-        eprintln!("TableScanner: '{}' → decoded {} rows", file_id, all_rows.len());
-
-        // Extract column names for the schema
         let column_names = column_specs
             .iter()
             .map(|c| c.column_name.clone())
@@ -79,20 +31,46 @@ impl TableScanner {
 
         TableScanner {
             column_names,
-            all_rows,
-            current_index: 0,
+            column_specs,
+            file_id: file_id.to_string(),
+            start_block,
+            num_blocks,
+            current_block: start_block,
+            batch_rows: VecDeque::new(),
         }
     }
 }
 
-impl Operator for TableScanner {
-    fn next(&mut self) -> Option<Row> {
-        if self.current_index < self.all_rows.len() {
-            let row = self.all_rows[self.current_index].clone();
-            self.current_index += 1;
-            Some(row)
-        } else {
-            None
+impl<R: Read, W: Write> Operator<R, W> for TableScanner {
+    fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row> {
+        loop {
+            if let Some(r) = self.batch_rows.pop_front() {
+                return Some(r);
+            }
+
+            if self.current_block >= self.start_block + self.num_blocks {
+                return None;
+            }
+
+            // Adapt dynamically limit based on BufferPool frames but fallback reasonably
+            // Using a max of either 20% of buffer pool or 256
+            let available_frames = (pool.num_frames() / 5).max(32) as u64;
+            let dynamic_batch_size = available_frames.clamp(32, 256);
+            
+            let count = dynamic_batch_size.min(self.start_block + self.num_blocks - self.current_block);
+            let raw = pool.read_blocks_sequential(self.current_block, count);
+            let block_size = pool.block_size();
+
+            for i in 0..count as usize {
+                let begin = i * block_size;
+                let end   = begin + block_size;
+                let block_data = &raw[begin..end];
+                let rows = decode_block(block_data, &self.column_specs);
+                for r in rows {
+                    self.batch_rows.push_back(r);
+                }
+            }
+            self.current_block += count;
         }
     }
 

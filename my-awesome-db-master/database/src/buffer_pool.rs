@@ -2,17 +2,27 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use crate::disk_manager::DiskManager;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictionPolicy {
+    LRU,
+    MRU,
+    CLOCK,
+}
+
 pub struct Frame {
     pub data: Vec<u8>,
     pub block_id: Option<u64>,
     pub dirty: bool,
     pub pin_count: u32,
+    pub referenced: bool,
 }
 
 pub struct BufferPool<R: Read, W: Write> {
     frames: Vec<Frame>,
     page_table: HashMap<u64, usize>,
     lru_list: VecDeque<usize>,
+    clock_hand: usize,
+    policy: EvictionPolicy,
     disk_manager: DiskManager<R, W>,
     block_size: usize,
     /// Next block ID to hand out from the anonymous (scratch) region.
@@ -28,6 +38,7 @@ impl<R: Read, W: Write> BufferPool<R, W> {
                 block_id: None,
                 dirty: false,
                 pin_count: 0,
+                referenced: false,
             })
             .collect();
 
@@ -35,10 +46,24 @@ impl<R: Read, W: Write> BufferPool<R, W> {
             frames,
             page_table: HashMap::new(),
             lru_list: VecDeque::new(),
+            clock_hand: 0,
+            policy: EvictionPolicy::LRU,
             disk_manager,
             block_size,
             next_anon_block_id: None,
         }
+    }
+
+    pub fn set_eviction_policy(&mut self, policy: EvictionPolicy) {
+        self.policy = policy;
+    }
+
+    pub fn get_eviction_policy(&self) -> EvictionPolicy {
+        self.policy
+    }
+
+    pub fn num_frames(&self) -> usize {
+        self.frames.len()
     }
 
     // ─── Anonymous (scratch) block allocator ─────────────────────────────
@@ -67,8 +92,11 @@ impl<R: Read, W: Write> BufferPool<R, W> {
         // Cache hit
         if let Some(&frame_idx) = self.page_table.get(&block_id) {
             self.frames[frame_idx].pin_count += 1;
-            self.lru_list.retain(|&x| x != frame_idx);
-            self.lru_list.push_front(frame_idx);
+            self.frames[frame_idx].referenced = true;
+            if self.policy != EvictionPolicy::CLOCK {
+                self.lru_list.retain(|&x| x != frame_idx);
+                self.lru_list.push_front(frame_idx);
+            }
             return self.frames[frame_idx].data.clone();
         }
 
@@ -79,8 +107,11 @@ impl<R: Read, W: Write> BufferPool<R, W> {
         self.frames[frame_idx].block_id   = Some(block_id);
         self.frames[frame_idx].dirty      = false;
         self.frames[frame_idx].pin_count  = 1;
+        self.frames[frame_idx].referenced = true;
         self.page_table.insert(block_id, frame_idx);
-        self.lru_list.push_front(frame_idx);
+        if self.policy != EvictionPolicy::CLOCK {
+            self.lru_list.push_front(frame_idx);
+        }
         self.frames[frame_idx].data.clone()
     }
 
@@ -132,17 +163,59 @@ impl<R: Read, W: Write> BufferPool<R, W> {
             }
         }
 
-        // 2. Evict the least-recently-used unpinned frame
+        // 2. Evict according to policy
         let mut evict_pos = None;
-        for i in (0..self.lru_list.len()).rev() {
-            let frame_idx = self.lru_list[i];
-            if self.frames[frame_idx].pin_count == 0 {
-                evict_pos = Some(i);
-                break;
+        let mut frame_idx_to_evict = 0;
+
+        match self.policy {
+            EvictionPolicy::LRU => {
+                for i in (0..self.lru_list.len()).rev() {
+                    let frame_idx = self.lru_list[i];
+                    if self.frames[frame_idx].pin_count == 0 {
+                        evict_pos = Some(i);
+                        frame_idx_to_evict = frame_idx;
+                        break;
+                    }
+                }
+                let lru_pos = evict_pos.expect("All frames pinned — buffer pool exhausted!");
+                self.lru_list.remove(lru_pos);
+            }
+            EvictionPolicy::MRU => {
+                for i in 0..self.lru_list.len() {
+                    let frame_idx = self.lru_list[i];
+                    if self.frames[frame_idx].pin_count == 0 {
+                        evict_pos = Some(i);
+                        frame_idx_to_evict = frame_idx;
+                        break;
+                    }
+                }
+                let mru_pos = evict_pos.expect("All frames pinned — buffer pool exhausted!");
+                self.lru_list.remove(mru_pos);
+            }
+            EvictionPolicy::CLOCK => {
+                loop {
+                    let mut is_evicted = false;
+                    {
+                        let frame = &mut self.frames[self.clock_hand];
+                        if frame.pin_count == 0 {
+                            if frame.referenced {
+                                frame.referenced = false;
+                            } else {
+                                frame_idx_to_evict = self.clock_hand;
+                                is_evicted = true;
+                            }
+                        }
+                    }
+                    if is_evicted {
+                        self.clock_hand = (self.clock_hand + 1) % self.frames.len();
+                        break;
+                    }
+                    self.clock_hand = (self.clock_hand + 1) % self.frames.len();
+                }
             }
         }
-        let lru_pos = evict_pos.expect("All frames pinned — buffer pool exhausted!");
-        let frame_idx = self.lru_list.remove(lru_pos).unwrap();
+
+        let frame_idx = frame_idx_to_evict;
 
         // 3. Write back dirty frame
         if self.frames[frame_idx].dirty {

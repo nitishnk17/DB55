@@ -22,13 +22,14 @@ use crate::row::Row;
 ///
 /// This is superior to BNLJ for large tables because the partition step
 /// ensures each in-memory hash table is small (≈ total_rows / N).
-pub struct HashJoinOp {
+pub struct HashJoinOp<R: Read, W: Write> {
     /// All joined result rows (materialized during construction).
     joined_rows: Vec<Row>,
     /// Current position in joined_rows for the iterator.
     current_index: usize,
     /// Output schema = left_schema ++ right_schema.
     output_schema: Vec<String>,
+    _marker: std::marker::PhantomData<(R, W)>,
 }
 
 // ─── Hashing Helper ──────────────────────────────────────────────────────
@@ -54,17 +55,17 @@ fn hash_data(val: &Data) -> u64 {
 ///
 /// Returns a Vec<Option<Run>> of length `num_partitions`.
 /// A None entry means that partition received zero rows.
-fn partition_input(
-    input: &mut Box<dyn Operator>,
+fn partition_input<R: Read, W: Write>(
+    input: &mut Box<dyn Operator<R, W>>,
     join_col_idx: usize,
     num_partitions: usize,
     _column_specs: &[ColumnSpec],
-    buffer_pool: &mut BufferPool<impl Read, impl Write>,
+    buffer_pool: &mut BufferPool<R, W>,
 ) -> Vec<Option<Run>> {
     // Accumulate rows per bucket in memory, then flush to disk.
     let mut buckets: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
 
-    while let Some(row) = input.next() {
+    while let Some(row) = input.next(buffer_pool) {
         let h = hash_data(&row.values[join_col_idx]);
         let bucket_id = (h as usize) % num_partitions;
         buckets[bucket_id].push(row);
@@ -165,15 +166,15 @@ fn build_and_probe(
 
 // ─── HashJoinOp Implementation ───────────────────────────────────────────
 
-impl HashJoinOp {
+impl<R: Read, W: Write> HashJoinOp<R, W> {
     pub fn new(
-        mut left: Box<dyn Operator>,
-        mut right: Box<dyn Operator>,
+        mut left: Box<dyn Operator<R, W>>,
+        mut right: Box<dyn Operator<R, W>>,
         left_col_idx: usize,
         right_col_idx: usize,
         left_column_specs: Vec<ColumnSpec>,
         right_column_specs: Vec<ColumnSpec>,
-        buffer_pool: &mut BufferPool<impl Read, impl Write>,
+        buffer_pool: &mut BufferPool<R, W>,
     ) -> Self {
         // Output schema = left columns followed by right columns
         let mut output_schema = left.schema();
@@ -204,6 +205,7 @@ impl HashJoinOp {
             &right_column_specs,
             buffer_pool,
         );
+
 
         // Phase 2: Build & Probe for each partition pair
         let mut joined_rows = Vec::new();
@@ -242,14 +244,15 @@ impl HashJoinOp {
             joined_rows,
             current_index: 0,
             output_schema,
+            _marker: std::marker::PhantomData,
         }
     }
 }
 
 // ─── Operator trait ──────────────────────────────────────────────────────
 
-impl Operator for HashJoinOp {
-    fn next(&mut self) -> Option<Row> {
+impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
+    fn next(&mut self, _pool: &mut BufferPool<R, W>) -> Option<Row> {
         if self.current_index < self.joined_rows.len() {
             let row = self.joined_rows[self.current_index].clone();
             self.current_index += 1;
