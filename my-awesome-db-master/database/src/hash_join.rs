@@ -108,9 +108,13 @@ fn build_and_probe(
     build_is_left: bool,
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
 ) -> Vec<Row> {
-    // BUILD: load entire build partition into an in-memory hash map
-    // Key = hash(join_val), Value = Vec<Row> (to handle collisions)
-    let mut hash_table: HashMap<u64, Vec<Row>> = HashMap::new();
+    // BUILD: load entire build partition into an in-memory hash map.
+    // Key = hash(join_val), Value = Vec<Row> (to handle collisions).
+    //
+    // Pre-size the map with the known row count so the HashMap never needs to
+    // rehash during the build phase.  `with_capacity(n)` guarantees at least n
+    // buckets, eliminating O(log n) rehash copies for large partitions.
+    let mut hash_table: HashMap<u64, Vec<Row>> = HashMap::with_capacity(build_run.num_rows);
 
     let mut build_reader = RunReader::new(build_run, build_specs.to_vec(), buffer_pool);
     loop {
@@ -123,8 +127,10 @@ fn build_and_probe(
         build_reader.advance(buffer_pool);
     }
 
-    // PROBE: scan probe partition, look up matches in hash table
-    let mut results = Vec::new();
+    // PROBE: scan probe partition, look up matches in hash table.
+    // Pre-allocate to avoid repeated reallocations; min(build, probe) is a
+    // safe lower bound for an equi-join result size.
+    let mut results = Vec::with_capacity(build_run.num_rows.min(probe_run.num_rows));
 
     let mut probe_reader = RunReader::new(probe_run, probe_specs.to_vec(), buffer_pool);
     loop {

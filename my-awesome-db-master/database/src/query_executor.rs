@@ -12,10 +12,15 @@ use db_config::table::ColumnSpec;
 use db_config::DbContext;
 use std::io::{Read, Write};
 
+/// Recursively build a physical operator tree from a logical `QueryOp` AST.
+///
+/// `sort_memory_bytes` is the byte budget available to each SortOp for its
+/// in-memory run-generation phase.  Pass ~50 % of the process memory limit.
 pub fn build_operator(
     query_op: &QueryOp,
     ctx: &DbContext,
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
+    sort_memory_bytes: usize,
 ) -> Box<dyn Operator> {
     match query_op {
         QueryOp::Scan(scan_data) => {
@@ -30,114 +35,180 @@ pub fn build_operator(
                 table_spec.column_specs.clone(),
             ))
         }
+
         QueryOp::Filter(filter_data) => {
-            // Check for potential Block Nested Loop Join pattern
-            if let QueryOp::Cross(cross_data) = &*filter_data.underlying {
-                let mut join_pred_idx = None;
-                for (i, p) in filter_data.predicates.iter().enumerate() {
-                    if let common::query::ComparisionOperator::EQ = p.operator {
-                        if let common::query::ComparisionValue::Column(col_b) = &p.value {
-                            join_pred_idx = Some((i, p.column_name.clone(), col_b.clone()));
-                            break;
+            // ── Multi-table join rewrite ──────────────────────────────────────
+            // A Filter wrapping a Cross (possibly nested) is a multi-way join.
+            // Flatten all tables, then build a join chain driven by predicates
+            // to avoid cross products.
+            if let QueryOp::Cross(_) = &*filter_data.underlying {
+                let leaves = flatten_cross_ops(&filter_data.underlying);
+                let leaf_schemas: Vec<Vec<String>> = leaves.iter()
+                    .map(|leaf| schema_of(leaf, ctx))
+                    .collect();
+
+                // ── Filter pushdown ───────────────────────────────────────────
+                // Partition predicates into:
+                //   scalar_preds[i] = predicates that only reference columns from leaf i
+                //   remaining_preds  = join predicates + multi-table predicates
+                let mut remaining_preds: Vec<common::query::Predicate> = Vec::new();
+                let mut scalar_preds: Vec<Vec<common::query::Predicate>> =
+                    (0..leaves.len()).map(|_| Vec::new()).collect();
+
+                for p in &filter_data.predicates {
+                    // A scalar pred: column_name in exactly one leaf AND value is not Column
+                    // (or both sides in the same leaf)
+                    let col_a = &p.column_name;
+                    let owner_a = leaf_schemas.iter().position(|s| s.contains(col_a));
+                    let is_scalar = match &p.value {
+                        common::query::ComparisionValue::Column(col_b) => {
+                            // Both columns in same leaf → scalar (intra-table)
+                            match leaf_schemas.iter().position(|s| s.contains(col_b)) {
+                                Some(o_b) => owner_a == Some(o_b),
+                                None => false,
+                            }
+                        }
+                        _ => owner_a.is_some(), // literal comparison → scalar for that leaf
+                    };
+                    if is_scalar {
+                        scalar_preds[owner_a.unwrap()].push(p.clone());
+                    } else {
+                        remaining_preds.push(p.clone());
+                    }
+                }
+
+                // ── Cardinality estimate after scalar pushdown ────────────────
+                // Prefer to start with the leaf that has scalar filters (more selective).
+                // Fall back to raw cardinality from stats.
+                let start_idx = {
+                    // Score: leaves with scalar filters score lower (preferred start)
+                    let scores: Vec<(usize, u64)> = leaf_schemas.iter().enumerate().map(|(i, schema)| {
+                        let base = estimate_cardinality(schema, ctx).unwrap_or(u64::MAX);
+                        let has_scalar = !scalar_preds[i].is_empty();
+                        // If it has scalar filters, assume 10x reduction
+                        let est = if has_scalar { base / 10 } else { base };
+                        (i, est)
+                    }).collect();
+                    scores.iter().min_by_key(|&&(_, c)| c).map(|&(i, _)| i).unwrap_or(0)
+                };
+
+                let mut joined = vec![false; leaves.len()];
+                joined[start_idx] = true;
+                // Build the starting leaf with its pushed-down scalar predicates
+                let start_leaf_op = build_leaf_with_filter(
+                    leaves[start_idx], &scalar_preds[start_idx], ctx, buffer_pool, sort_memory_bytes);
+                let mut current_op = start_leaf_op;
+                let mut current_schema = leaf_schemas[start_idx].clone();
+
+                while joined.iter().any(|&m| !m) {
+                    // Find next leaf connected to current result by an EQ join pred
+                    let mut found = false;
+                    'search: for leaf_idx in 0..leaves.len() {
+                        if joined[leaf_idx] { continue; }
+                        let new_schema = &leaf_schemas[leaf_idx];
+                        for pred_idx in 0..remaining_preds.len() {
+                            if let common::query::ComparisionOperator::EQ = remaining_preds[pred_idx].operator {
+                                if let common::query::ComparisionValue::Column(col_b) = &remaining_preds[pred_idx].value.clone() {
+                                    let col_a = remaining_preds[pred_idx].column_name.clone();
+                                    let a_cur = current_schema.contains(&col_a);
+                                    let b_new = new_schema.contains(col_b);
+                                    let b_cur = current_schema.contains(col_b);
+                                    let a_new = new_schema.contains(&col_a);
+                                    if (a_cur && b_new) || (b_cur && a_new) {
+                                        // Build this leaf with its pushed-down scalar preds
+                                        let right_op = build_leaf_with_filter(
+                                            leaves[leaf_idx], &scalar_preds[leaf_idx],
+                                            ctx, buffer_pool, sort_memory_bytes);
+                                        let right_schema = right_op.schema();
+                                        let (l_idx, r_idx) = if a_cur && b_new {
+                                            (current_schema.iter().position(|x| x == &col_a).unwrap(),
+                                             right_schema.iter().position(|x| x == col_b).unwrap())
+                                        } else {
+                                            (current_schema.iter().position(|x| x == col_b).unwrap(),
+                                             right_schema.iter().position(|x| x == &col_a).unwrap())
+                                        };
+                                        let lcs = resolve_column_specs(&current_schema, ctx);
+                                        let rcs = resolve_column_specs(&right_schema, ctx);
+                                        current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
+                                            eprintln!("Join strategy: Grace Hash Join");
+                                            Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, lcs, rcs, buffer_pool))
+                                        } else {
+                                            eprintln!("Join strategy: Block Nested Loop Join");
+                                            Box::new(crate::join::JoinOp::new(current_op, right_op, l_idx, r_idx, rcs, buffer_pool))
+                                        };
+                                        current_schema.extend(right_schema);
+                                        joined[leaf_idx] = true;
+                                        remaining_preds.remove(pred_idx);
+                                        found = true;
+                                        break 'search;
+                                    }
+                                }
+                            }
                         }
                     }
-                }
-
-                if let Some((idx, col_a, col_b)) = join_pred_idx {
-                    // Valid equi-join detected!
-                    let left = build_operator(&cross_data.left, ctx, buffer_pool);
-                    let right_op = build_operator(&cross_data.right, ctx, buffer_pool);
-
-                    let left_schema = left.schema();
-                    let right_schema = right_op.schema();
-
-                    let (left_col_idx, right_col_idx) =
-                        if let Some(l_idx) = left_schema.iter().position(|x| *x == col_a) {
-                            let r_idx = right_schema.iter().position(|x| *x == col_b).unwrap();
-                            (l_idx, r_idx)
-                        } else if let Some(l_idx) = left_schema.iter().position(|x| *x == col_b) {
-                            let r_idx = right_schema.iter().position(|x| *x == col_a).unwrap();
-                            (l_idx, r_idx)
-                        } else {
-                            panic!("Join columns not found in left schema");
-                        };
-
-                    let left_column_specs = resolve_column_specs(&left_schema, ctx);
-                    let right_column_specs = resolve_column_specs(&right_schema, ctx);
-
-                    // Choose join strategy based on estimated table cardinality
-                    let use_hash_join = should_use_hash_join(&left_schema, &right_schema, ctx);
-
-                    let join_op: Box<dyn Operator> = if use_hash_join {
-                        eprintln!("Join strategy: Grace Hash Join");
-                        Box::new(HashJoinOp::new(
-                            left,
-                            right_op,
-                            left_col_idx,
-                            right_col_idx,
-                            left_column_specs,
-                            right_column_specs,
-                            buffer_pool,
-                        ))
-                    } else {
-                        eprintln!("Join strategy: Block Nested Loop Join");
-                        Box::new(crate::join::JoinOp::new(
-                            left,
-                            right_op,
-                            left_col_idx,
-                            right_col_idx,
-                            right_column_specs,
-                            buffer_pool,
-                        ))
-                    };
-
-                    // Push remaining conditions into a standard FilterOp above
-                    let mut remaining_preds = filter_data.predicates.clone();
-                    remaining_preds.remove(idx);
-
-                    if remaining_preds.is_empty() {
-                        return join_op;
-                    } else {
-                        return Box::new(FilterOp::new(join_op, remaining_preds));
+                    if !found {
+                        // No join predicate found: do a cross product with next unjoined leaf
+                        let leaf_idx = joined.iter().position(|&m| !m).unwrap();
+                        let right_op = build_leaf_with_filter(
+                            leaves[leaf_idx], &scalar_preds[leaf_idx],
+                            ctx, buffer_pool, sort_memory_bytes);
+                        let right_schema = right_op.schema();
+                        current_op = Box::new(CrossOp::new(current_op, right_op));
+                        current_schema.extend(right_schema);
+                        joined[leaf_idx] = true;
                     }
                 }
+
+                return if remaining_preds.is_empty() {
+                    current_op
+                } else {
+                    Box::new(FilterOp::new(current_op, remaining_preds))
+                };
             }
 
-            // Standard fallback Filter
-            let child = build_operator(&filter_data.underlying, ctx, buffer_pool);
+            // Standard filter (no join rewrite)
+            let child = build_operator(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes);
             Box::new(FilterOp::new(child, filter_data.predicates.clone()))
         }
+
         QueryOp::Project(project_data) => {
-            // 1. Recursively build the child operator first
-            let child = build_operator(&project_data.underlying, ctx, buffer_pool);
-            // 2. Wrap it with ProjectOp
+            let child = build_operator(&project_data.underlying, ctx, buffer_pool, sort_memory_bytes);
             Box::new(ProjectOp::new(child, project_data.column_name_map.clone()))
         }
+
         QueryOp::Cross(cross_data) => {
-            // Build BOTH children recursively
-            let left = build_operator(&cross_data.left, ctx, buffer_pool);
-            let right = build_operator(&cross_data.right, ctx, buffer_pool);
+            let left  = build_operator(&cross_data.left,  ctx, buffer_pool, sort_memory_bytes);
+            let right = build_operator(&cross_data.right, ctx, buffer_pool, sort_memory_bytes);
             Box::new(CrossOp::new(left, right))
         }
+
         QueryOp::Sort(sort_data) => {
-            let child = build_operator(&sort_data.underlying, ctx, buffer_pool);
-            let child_schema = child.schema();
-            let column_specs = resolve_column_specs(&child_schema, ctx);
+            let child = build_operator(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes);
+            let child_schema  = child.schema();
+            let column_specs  = resolve_column_specs(&child_schema, ctx);
             Box::new(SortOp::new(
                 child,
                 sort_data.sort_specs.clone(),
                 column_specs,
                 buffer_pool,
+                sort_memory_bytes,   // ← pass the real budget
             ))
         }
     }
 }
 
-/// Look up ColumnSpec (with DataType) for each column name by searching all tables.
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Look up the ColumnSpec (DataType + stats) for each column name in the schema
+/// by scanning all tables in the context.
+///
+/// For aliased columns like "l1.l_orderkey", we first try the full name, then
+/// strip the alias prefix (everything before the first '.') and try the base name.
 fn resolve_column_specs(schema: &[String], ctx: &DbContext) -> Vec<ColumnSpec> {
     schema
         .iter()
         .map(|col_name| {
+            // Try exact match first
             for table in ctx.get_table_specs() {
                 for cs in &table.column_specs {
                     if cs.column_name == *col_name {
@@ -145,18 +216,43 @@ fn resolve_column_specs(schema: &[String], ctx: &DbContext) -> Vec<ColumnSpec> {
                     }
                 }
             }
-            panic!("Column '{}' not found in any table", col_name);
+            // Try stripping alias prefix (e.g. "l1.l_orderkey" → "l_orderkey")
+            if let Some(dot_pos) = col_name.find('.') {
+                let base_name = &col_name[dot_pos + 1..];
+                for table in ctx.get_table_specs() {
+                    for cs in &table.column_specs {
+                        if cs.column_name == base_name {
+                            return ColumnSpec {
+                                column_name: col_name.clone(),
+                                data_type: cs.data_type.clone(),
+                                stats: cs.stats.clone(),
+                            };
+                        }
+                    }
+                }
+            }
+            // Fallback: create a synthetic String spec so the code doesn't panic on
+            // computed / renamed columns that don't appear in any base table.
+            eprintln!("Warning: column '{}' not found in any table spec; defaulting to String", col_name);
+            ColumnSpec {
+                column_name: col_name.clone(),
+                data_type: common::DataType::String,
+                stats: None,
+            }
         })
         .collect()
 }
 
-/// Heuristic to decide whether to use Grace Hash Join or BNLJ.
-/// Uses CardinalityStat if available; defaults to hash join for safety.
+/// Decide between Grace Hash Join and BNLJ based on cardinality statistics.
+///
+/// Rules:
+///   • If either side has cardinality > threshold → Hash Join (handles large tables)
+///   • If both sides are tiny (≤ threshold)       → BNLJ   (lower constant factor)
+///   • If stats are unavailable                   → Hash Join (safe default)
 fn should_use_hash_join(left_schema: &[String], right_schema: &[String], ctx: &DbContext) -> bool {
-    let threshold = 1000u64;
+    let threshold = 1_000u64;
 
-    // Try to find cardinality stats for columns in each side
-    let left_card = estimate_cardinality(left_schema, ctx);
+    let left_card  = estimate_cardinality(left_schema, ctx);
     let right_card = estimate_cardinality(right_schema, ctx);
 
     match (left_card, right_card) {
@@ -165,24 +261,82 @@ fn should_use_hash_join(left_schema: &[String], right_schema: &[String], ctx: &D
             l > threshold || r > threshold
         }
         _ => {
-            // No stats available — default to hash join (safer for unknown sizes)
-            eprintln!("Join heuristic: no cardinality stats, defaulting to hash join");
+            eprintln!("Join heuristic: no cardinality stats, defaulting to Hash Join");
             true
         }
     }
 }
 
-/// Look up the CardinalityStat for any column belonging to a schema.
-/// Returns the first cardinality found (all columns in a table share similar values).
+/// Build a leaf operator, wrapping it in a FilterOp if there are pushed-down predicates.
+fn build_leaf_with_filter<R: Read, W: Write>(
+    leaf: &QueryOp,
+    scalar_preds: &[common::query::Predicate],
+    ctx: &DbContext,
+    buffer_pool: &mut BufferPool<R, W>,
+    sort_memory_bytes: usize,
+) -> Box<dyn Operator> {
+    let op = build_operator(leaf, ctx, buffer_pool, sort_memory_bytes);
+    if scalar_preds.is_empty() {
+        op
+    } else {
+        Box::new(FilterOp::new(op, scalar_preds.to_vec()))
+    }
+}
+
+/// Flatten a nested Cross tree into a list of leaf QueryOps.
+fn flatten_cross_ops(op: &QueryOp) -> Vec<&QueryOp> {
+    match op {
+        QueryOp::Cross(c) => {
+            let mut v = flatten_cross_ops(&c.left);
+            v.extend(flatten_cross_ops(&c.right));
+            v
+        }
+        other => vec![other],
+    }
+}
+
+/// Compute the output schema of a QueryOp without building the actual operator.
+/// Used to verify join predicate column placement before building children.
+fn schema_of(op: &QueryOp, ctx: &DbContext) -> Vec<String> {
+    match op {
+        QueryOp::Scan(scan) => {
+            ctx.get_table_specs()
+                .iter()
+                .find(|t| t.name == scan.table_id)
+                .map(|t| t.column_specs.iter().map(|c| c.column_name.clone()).collect())
+                .unwrap_or_default()
+        }
+        QueryOp::Filter(f) => schema_of(&f.underlying, ctx),
+        QueryOp::Project(p) => p.column_name_map.iter().map(|(_, to)| to.clone()).collect(),
+        QueryOp::Cross(c) => {
+            let mut s = schema_of(&c.left, ctx);
+            s.extend(schema_of(&c.right, ctx));
+            s
+        }
+        QueryOp::Sort(s) => schema_of(&s.underlying, ctx),
+    }
+}
+
+/// Return the first CardinailtyData value found for any column in the schema.
+/// Handles aliased columns like "l1.l_orderkey" by stripping the alias prefix.
 fn estimate_cardinality(schema: &[String], ctx: &DbContext) -> Option<u64> {
     for col_name in schema {
-        for table in ctx.get_table_specs() {
-            for cs in &table.column_specs {
-                if cs.column_name == *col_name {
-                    if let Some(stats) = &cs.stats {
-                        for stat in stats {
-                            if let ColumnStat::CardinalityStat(CardinalityData(card)) = stat {
-                                return Some(*card);
+        // Try exact match, then alias-stripped match
+        let names_to_try: &[&str] = if let Some(dot) = col_name.find('.') {
+            let base = &col_name[dot + 1..];
+            &[col_name.as_str(), base]
+        } else {
+            &[col_name.as_str()]
+        };
+        for &name in names_to_try {
+            for table in ctx.get_table_specs() {
+                for cs in &table.column_specs {
+                    if cs.column_name == name {
+                        if let Some(stats) = &cs.stats {
+                            for stat in stats {
+                                if let ColumnStat::CardinalityStat(CardinalityData(card)) = stat {
+                                    return Some(*card);
+                                }
                             }
                         }
                     }

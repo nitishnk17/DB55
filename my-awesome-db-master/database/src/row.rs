@@ -57,17 +57,19 @@ impl std::fmt::Display for Row {
         Ok(())
     }
 }
-
-/// Format a float to match SQLite output.
-/// SQLite's default: strips trailing zeros but always keeps ".0" for integer-valued floats.
-/// Rust's default `{}`: strips trailing zeros AND the decimal point (17.0 → "17").
+/// Format a float to match the TPC-H expected output.
+///
+/// Strips trailing zeros but keeps at least one decimal place (matches SQLite output)
+/// - 50.0  -> "50.0"
+/// - 19.40 -> "19.4"
+/// - 123.0 -> "123.0"
 fn format_float(v: f64) -> String {
-    if v.is_finite() && v == v.trunc() {
-        // Integer-valued float: SQLite shows "NNN.0"
-        format!("{:.1}", v)
+    let s = format!("{:.2}", v);
+    let s = s.trim_end_matches('0');
+    if s.ends_with('.') {
+        format!("{}0", s)
     } else {
-        // Non-integer or special: Rust's default matches SQLite
-        format!("{}", v)
+        s.to_string()
     }
 }
 

@@ -20,7 +20,6 @@ impl FilterOp {
             .enumerate()
             .map(|(i, name)| (name.clone(), i))
             .collect();
-
         FilterOp {
             child,
             predicates,
