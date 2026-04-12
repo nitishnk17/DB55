@@ -5,20 +5,21 @@ use crate::disk_run::{rows_to_blocks, Run, RunReader};
 use crate::operator::Operator;
 use crate::row::Row;
 
-pub struct JoinOp {
+pub struct JoinOp<R: Read, W: Write> {
     joined_rows: Vec<Row>,
     current_index: usize,
     output_schema: Vec<String>,
+    _marker: std::marker::PhantomData<(R, W)>,
 }
 
-impl JoinOp {
+impl<R: Read, W: Write> JoinOp<R, W> {
     pub fn new(
-        mut left: Box<dyn Operator>,
-        mut right: Box<dyn Operator>,
+        mut left: Box<dyn Operator<R, W>>,
+        mut right: Box<dyn Operator<R, W>>,
         left_col_idx: usize,
         right_col_idx: usize,
         right_column_specs: Vec<ColumnSpec>,
-        buffer_pool: &mut BufferPool<impl Read, impl Write>,
+        buffer_pool: &mut BufferPool<R, W>,
     ) -> Self {
         // Output schema
         let mut output_schema = left.schema();
@@ -26,7 +27,7 @@ impl JoinOp {
 
         // 1. Materialize the right child entirely into anonymous blocks
         let mut right_rows = Vec::new();
-        while let Some(row) = right.next() {
+        while let Some(row) = right.next(buffer_pool) {
             right_rows.push(row);
         }
 
@@ -57,7 +58,7 @@ impl JoinOp {
             // Read `max_chunk_rows` from outer (left)
             let mut left_chunk = Vec::new();
             for _ in 0..max_chunk_rows {
-                if let Some(row) = left.next() {
+                if let Some(row) = left.next(buffer_pool) {
                     left_chunk.push(row);
                 } else {
                     break;
@@ -97,12 +98,13 @@ impl JoinOp {
             joined_rows,
             current_index: 0,
             output_schema,
+            _marker: std::marker::PhantomData,
         }
     }
 }
 
-impl Operator for JoinOp {
-    fn next(&mut self) -> Option<Row> {
+impl<R: Read, W: Write> Operator<R, W> for JoinOp<R, W> {
+    fn next(&mut self, _pool: &mut BufferPool<R, W>) -> Option<Row> {
         if self.current_index < self.joined_rows.len() {
             let row = self.joined_rows[self.current_index].clone();
             self.current_index += 1;

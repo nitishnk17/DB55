@@ -12,14 +12,15 @@ use crate::row::{encode_row, Row};
 
 // ─── SortOp ─────────────────────────────────────────────────────────────────
 
-pub struct SortOp {
+pub struct SortOp<R: Read, W: Write> {
     sorted_rows: Vec<Row>,
     current_index: usize,
     output_schema: Vec<String>,
+    _marker: std::marker::PhantomData<(R, W)>,
 }
 
-impl Operator for SortOp {
-    fn next(&mut self) -> Option<Row> {
+impl<R: Read, W: Write> Operator<R, W> for SortOp<R, W> {
+    fn next(&mut self, _pool: &mut BufferPool<R, W>) -> Option<Row> {
         if self.current_index < self.sorted_rows.len() {
             let row = self.sorted_rows[self.current_index].clone();
             self.current_index += 1;
@@ -34,7 +35,7 @@ impl Operator for SortOp {
     }
 }
 
-impl SortOp {
+impl<R: Read, W: Write> SortOp<R, W> {
     /// Create a new SortOp.
     ///
     /// `sort_memory_bytes` is the total byte budget available for holding rows
@@ -42,10 +43,10 @@ impl SortOp {
     /// process memory limit so we leave room for the buffer pool and other
     /// operators.
     pub fn new(
-        mut child: Box<dyn Operator>,
+        mut child: Box<dyn Operator<R, W>>,
         sort_specs: Vec<SortSpec>,
         column_specs: Vec<ColumnSpec>,
-        buffer_pool: &mut BufferPool<impl Read, impl Write>,
+        buffer_pool: &mut BufferPool<R, W>,
         sort_memory_bytes: usize,
     ) -> Self {
         let output_schema = child.schema();
@@ -78,7 +79,7 @@ impl SortOp {
         // Materialize rows, switching to external sort when budget is exceeded
         let mut all_rows = Vec::new();
         let mut exceeded = false;
-        while let Some(row) = child.next() {
+        while let Some(row) = child.next(buffer_pool) {
             all_rows.push(row);
             if all_rows.len() > memory_budget_rows {
                 exceeded = true;
@@ -94,6 +95,7 @@ impl SortOp {
                 sorted_rows: all_rows,
                 current_index: 0,
                 output_schema,
+                _marker: std::marker::PhantomData,
             };
         }
 
@@ -128,7 +130,7 @@ impl SortOp {
             // Read the next batch from the child
             all_rows.clear();
             for _ in 0..memory_budget_rows {
-                match child.next() {
+                match child.next(buffer_pool) {
                     Some(row) => all_rows.push(row),
                     None => break,
                 }
@@ -155,6 +157,7 @@ impl SortOp {
             sorted_rows,
             current_index: 0,
             output_schema,
+            _marker: std::marker::PhantomData,
         }
     }
 }
