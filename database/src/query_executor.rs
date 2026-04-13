@@ -49,11 +49,20 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
 
         QueryOp::Filter(filter_data) => {
             // ── Multi-table join rewrite ──────────────────────────────────────
-            // A Filter wrapping a Cross (possibly nested) is a multi-way join.
-            // Flatten all tables, then build a join chain driven by predicates
-            // to avoid cross products.
-            if let QueryOp::Cross(_) = &*filter_data.underlying {
-                let leaves = flatten_cross_ops(&filter_data.underlying);
+            // A Filter (possibly stacked with other Filters) wrapping a Cross
+            // (possibly nested) is a multi-way join.
+            // First, collect ALL predicates from consecutive Filter nodes above
+            // the Cross, so that join predicates in outer Filters are not missed.
+            let mut all_filter_predicates = filter_data.predicates.clone();
+            let mut innermost: &QueryOp = &*filter_data.underlying;
+            while let QueryOp::Filter(inner_f) = innermost {
+                all_filter_predicates.extend(inner_f.predicates.clone());
+                innermost = &*inner_f.underlying;
+            }
+
+            // Now `innermost` is the first non-Filter node beneath the stack.
+            if let QueryOp::Cross(_) = innermost {
+                let leaves = flatten_cross_ops(innermost);
                 let leaf_schemas: Vec<Vec<String>> = leaves.iter()
                     .map(|leaf| schema_of(leaf, ctx))
                     .collect();
@@ -66,7 +75,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                 let mut scalar_preds: Vec<Vec<common::query::Predicate>> =
                     (0..leaves.len()).map(|_| Vec::new()).collect();
 
-                for p in &filter_data.predicates {
+                for p in &all_filter_predicates {
                     // A scalar pred: column_name in exactly one leaf AND value is not Column
                     // (or both sides in the same leaf)
                     let col_a = &p.column_name;
