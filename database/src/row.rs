@@ -57,19 +57,27 @@ impl std::fmt::Display for Row {
         Ok(())
     }
 }
-/// Format a float to match the TPC-H expected output.
+/// Format a float to match SQLite output.
 ///
-/// Strips trailing zeros but keeps at least one decimal place (matches SQLite output)
-/// - 50.0  -> "50.0"
-/// - 19.40 -> "19.4"
-/// - 123.0 -> "123.0"
+/// SQLite uses the equivalent of C's `%.15g` format for REAL values:
+/// up to 15 significant digits, trailing zeros stripped, with a decimal
+/// point always present for non-scientific notation.
+///
+/// Examples:
+/// - 50.0       -> "50.0"
+/// - 19.40      -> "19.4"
+/// - 0.123      -> "0.123"
+/// - 1234.5678  -> "1234.5678"
+/// - 0.001      -> "0.001"
+/// - 3.14159    -> "3.14159"
 fn format_float(v: f64) -> String {
-    let s = format!("{:.2}", v);
-    let s = s.trim_end_matches('0');
-    if s.ends_with('.') {
-        format!("{}0", s)
+    // Use the same precision SQLite uses internally (%.15g)
+    let s = format!("{:.15g}", v);
+    // Ensure there's always a decimal point (SQLite always shows one for REAL)
+    if !s.contains('.') && !s.contains('e') && !s.contains('E') {
+        format!("{}.0", s)
     } else {
-        s.to_string()
+        s
     }
 }
 
