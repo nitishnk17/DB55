@@ -26,15 +26,7 @@ mod sort;
 mod table_scanner;
 
 fn db_main() -> Result<()> {
-    // Redirect stderr to /dev/null so that RLIMIT_FSIZE=0 (set by monitor)
-    // doesn't kill this process via SIGXFSZ when debug prints go to a file.
-    unsafe {
-        let dev_null = libc::open(b"/dev/null\0".as_ptr() as *const libc::c_char, libc::O_WRONLY);
-        if dev_null >= 0 {
-            libc::dup2(dev_null, 2);
-            libc::close(dev_null);
-        }
-    }
+    // Removed stderr DEV_NULL interceptor
 
     let cli_options = CliOptions::parse();
 
@@ -125,7 +117,7 @@ fn db_main() -> Result<()> {
     monitor_out.write_all(b"validate\n")?;
     monitor_out.flush()?;
 
-    while let Some(row) = root_op.next() {
+    while let Some(row) = root_op.next(&mut buffer_pool) {
         monitor_out.write_all(format!("{}\n", row).as_bytes())?;
     }
 

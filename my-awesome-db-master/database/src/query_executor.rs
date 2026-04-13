@@ -16,12 +16,23 @@ use std::io::{Read, Write};
 ///
 /// `sort_memory_bytes` is the byte budget available to each SortOp for its
 /// in-memory run-generation phase.  Pass ~50 % of the process memory limit.
-pub fn build_operator(
+pub fn build_operator<R: Read + 'static, W: Write + 'static>(
     query_op: &QueryOp,
     ctx: &DbContext,
-    buffer_pool: &mut BufferPool<impl Read, impl Write>,
+    buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
-) -> Box<dyn Operator> {
+) -> Box<dyn Operator<R, W>> {
+    let global_needed = get_all_used_columns(query_op);
+    build_operator_internal(query_op, ctx, buffer_pool, sort_memory_bytes, &global_needed)
+}
+
+fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
+    query_op: &QueryOp,
+    ctx: &DbContext,
+    buffer_pool: &mut BufferPool<R, W>,
+    sort_memory_bytes: usize,
+    global_needed: &std::collections::HashSet<String>,
+) -> Box<dyn Operator<R, W>> {
     match query_op {
         QueryOp::Scan(scan_data) => {
             let table_spec = ctx
@@ -96,7 +107,7 @@ pub fn build_operator(
                 joined[start_idx] = true;
                 // Build the starting leaf with its pushed-down scalar predicates
                 let start_leaf_op = build_leaf_with_filter(
-                    leaves[start_idx], &scalar_preds[start_idx], ctx, buffer_pool, sort_memory_bytes);
+                    leaves[start_idx], &scalar_preds[start_idx], &global_needed, ctx, buffer_pool, sort_memory_bytes);
                 let mut current_op = start_leaf_op;
                 let mut current_schema = leaf_schemas[start_idx].clone();
 
@@ -117,23 +128,29 @@ pub fn build_operator(
                                     if (a_cur && b_new) || (b_cur && a_new) {
                                         // Build this leaf with its pushed-down scalar preds
                                         let right_op = build_leaf_with_filter(
-                                            leaves[leaf_idx], &scalar_preds[leaf_idx],
+                                            leaves[leaf_idx], &scalar_preds[leaf_idx], &global_needed,
                                             ctx, buffer_pool, sort_memory_bytes);
                                         let right_schema = right_op.schema();
+                                        let l_actual_schema = current_op.schema();
                                         let (l_idx, r_idx) = if a_cur && b_new {
-                                            (current_schema.iter().position(|x| x == &col_a).unwrap(),
+                                            (l_actual_schema.iter().position(|x| x == &col_a).unwrap(),
                                              right_schema.iter().position(|x| x == col_b).unwrap())
                                         } else {
-                                            (current_schema.iter().position(|x| x == col_b).unwrap(),
+                                            (l_actual_schema.iter().position(|x| x == col_b).unwrap(),
                                              right_schema.iter().position(|x| x == &col_a).unwrap())
                                         };
-                                        let lcs = resolve_column_specs(&current_schema, ctx);
+                                        let lcs = resolve_column_specs(&l_actual_schema, ctx);
                                         let rcs = resolve_column_specs(&right_schema, ctx);
+                                        
                                         current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
-                                            eprintln!("Join strategy: Grace Hash Join");
+                                            eprintln!("Join strategy: Grace Hash Join (Setting LRU cache)");
+                                            buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::LRU);
                                             Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, lcs, rcs, buffer_pool))
                                         } else {
-                                            eprintln!("Join strategy: Block Nested Loop Join");
+                                            // Implement adaptive dynamic eviction: nested loops benefit immensely from MRU
+                                            // to prevent sequential flooding of the outer loop over inner data
+                                            eprintln!("Join strategy: Block Nested Loop Join (Setting MRU cache)");
+                                            buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::MRU);
                                             Box::new(crate::join::JoinOp::new(current_op, right_op, l_idx, r_idx, rcs, buffer_pool))
                                         };
                                         current_schema.extend(right_schema);
@@ -150,10 +167,10 @@ pub fn build_operator(
                         // No join predicate found: do a cross product with next unjoined leaf
                         let leaf_idx = joined.iter().position(|&m| !m).unwrap();
                         let right_op = build_leaf_with_filter(
-                            leaves[leaf_idx], &scalar_preds[leaf_idx],
+                            leaves[leaf_idx], &scalar_preds[leaf_idx], &global_needed,
                             ctx, buffer_pool, sort_memory_bytes);
                         let right_schema = right_op.schema();
-                        current_op = Box::new(CrossOp::new(current_op, right_op));
+                        current_op = Box::new(CrossOp::new(current_op, right_op, buffer_pool));
                         current_schema.extend(right_schema);
                         joined[leaf_idx] = true;
                     }
@@ -167,23 +184,23 @@ pub fn build_operator(
             }
 
             // Standard filter (no join rewrite)
-            let child = build_operator(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes);
+            let child = build_operator_internal(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
             Box::new(FilterOp::new(child, filter_data.predicates.clone()))
         }
 
         QueryOp::Project(project_data) => {
-            let child = build_operator(&project_data.underlying, ctx, buffer_pool, sort_memory_bytes);
+            let child = build_operator_internal(&project_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
             Box::new(ProjectOp::new(child, project_data.column_name_map.clone()))
         }
 
         QueryOp::Cross(cross_data) => {
-            let left  = build_operator(&cross_data.left,  ctx, buffer_pool, sort_memory_bytes);
-            let right = build_operator(&cross_data.right, ctx, buffer_pool, sort_memory_bytes);
-            Box::new(CrossOp::new(left, right))
+            let left  = build_operator_internal(&cross_data.left,  ctx, buffer_pool, sort_memory_bytes, global_needed);
+            let right = build_operator_internal(&cross_data.right, ctx, buffer_pool, sort_memory_bytes, global_needed);
+            Box::new(CrossOp::new(left, right, buffer_pool))
         }
 
         QueryOp::Sort(sort_data) => {
-            let child = build_operator(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes);
+            let child = build_operator_internal(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
             let child_schema  = child.schema();
             let column_specs  = resolve_column_specs(&child_schema, ctx);
             Box::new(SortOp::new(
@@ -267,20 +284,72 @@ fn should_use_hash_join(left_schema: &[String], right_schema: &[String], ctx: &D
     }
 }
 
-/// Build a leaf operator, wrapping it in a FilterOp if there are pushed-down predicates.
-fn build_leaf_with_filter<R: Read, W: Write>(
+/// Recursively scan AST to extract every column name that upper levels depend on
+fn get_all_used_columns(query: &QueryOp) -> std::collections::HashSet<String> {
+    let mut cols = std::collections::HashSet::new();
+    match query {
+        QueryOp::Scan(_) => {}
+        QueryOp::Filter(f) => {
+            cols.extend(get_all_used_columns(&f.underlying));
+            for p in &f.predicates {
+                cols.insert(p.column_name.clone());
+                if let common::query::ComparisionValue::Column(c) = &p.value {
+                    cols.insert(c.clone());
+                }
+            }
+        }
+        QueryOp::Project(p) => {
+            cols.extend(get_all_used_columns(&p.underlying));
+            for (old, _) in &p.column_name_map {
+                cols.insert(old.clone());
+            }
+        }
+        QueryOp::Cross(c) => {
+            cols.extend(get_all_used_columns(&c.left));
+            cols.extend(get_all_used_columns(&c.right));
+        }
+        QueryOp::Sort(s) => {
+            cols.extend(get_all_used_columns(&s.underlying));
+            for sort_spec in &s.sort_specs {
+                cols.insert(sort_spec.column_name.clone());
+            }
+        }
+    }
+    cols
+}
+
+
+/// Build a leaf operator, wrapping it in a FilterOp if there are pushed-down predicates, 
+/// and finally a ProjectOp limiting it to the globally required columns.
+fn build_leaf_with_filter<R: Read + 'static, W: Write + 'static>(
     leaf: &QueryOp,
     scalar_preds: &[common::query::Predicate],
+    global_needed: &std::collections::HashSet<String>,
     ctx: &DbContext,
     buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
-) -> Box<dyn Operator> {
-    let op = build_operator(leaf, ctx, buffer_pool, sort_memory_bytes);
-    if scalar_preds.is_empty() {
-        op
-    } else {
-        Box::new(FilterOp::new(op, scalar_preds.to_vec()))
+) -> Box<dyn Operator<R, W>> {
+    let mut op = build_operator_internal(leaf, ctx, buffer_pool, sort_memory_bytes, global_needed);
+    
+    if !scalar_preds.is_empty() {
+        op = Box::new(FilterOp::new(op, scalar_preds.to_vec()));
     }
+
+    let current_schema = op.schema();
+    
+    // Project pushdown: Keep only columns requested globally that are present in the current schema
+    let needed_here: Vec<(String, String)> = current_schema
+        .into_iter()
+        .filter(|c| global_needed.contains(c))
+        .map(|c| (c.clone(), c))
+        .collect();
+        
+    // Only wrap with ProjectOp if it actually restricts columns
+    if !needed_here.is_empty() && needed_here.len() < op.schema().len() {
+        op = Box::new(ProjectOp::new(op, needed_here));
+    }
+
+    op
 }
 
 /// Flatten a nested Cross tree into a list of leaf QueryOps.

@@ -1,16 +1,19 @@
 use crate::operator::Operator;
 use crate::row::Row;
 
-pub struct CrossOp {
-    left: Box<dyn Operator>,       // we pull from left one-at-a-time
+use std::io::{Read, Write};
+use crate::buffer_pool::BufferPool;
+
+pub struct CrossOp<R: Read, W: Write> {
+    left: Box<dyn Operator<R, W>>,
     right_rows: Vec<Row>,          // right child fully materialized
     current_left_row: Option<Row>, // the current left row we're pairing with
     right_index: usize,            // which right row we're currently at
     output_schema: Vec<String>,    // concatenation of left + right schemas
 }
 
-impl CrossOp {
-    pub fn new(mut left: Box<dyn Operator>, mut right: Box<dyn Operator>) -> Self {
+impl<R: Read, W: Write> CrossOp<R, W> {
+    pub fn new(mut left: Box<dyn Operator<R, W>>, mut right: Box<dyn Operator<R, W>>, pool: &mut BufferPool<R, W>) -> Self {
         // 1. Compute the output schema BEFORE draining right
         //    (schema() is available before next() is called)
         let left_schema = left.schema();
@@ -20,11 +23,11 @@ impl CrossOp {
 
         // 2. Materialize the right child: drain all rows into a Vec
         let mut right_rows = Vec::new();
-        while let Some(row) = right.next() {
+        while let Some(row) = right.next(pool) {
             right_rows.push(row);
         }
         // 3. Get the first left row
-        let current_left_row = left.next();
+        let current_left_row = left.next(pool);
 
         CrossOp {
             left,
@@ -36,8 +39,8 @@ impl CrossOp {
     }
 }
 
-impl Operator for CrossOp {
-    fn next(&mut self) -> Option<Row> {
+impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
+    fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row> {
         loop {
             // 1. If no current left row, we're done
             let left_row = match &self.current_left_row {
@@ -58,7 +61,7 @@ impl Operator for CrossOp {
             }
 
             // 3. Exhausted right rows for this left row → advance to next left
-            self.current_left_row = self.left.next();
+            self.current_left_row = self.left.next(pool);
             self.right_index = 0;
             // Loop back to step 1 (if new left_row exists, start pairing again)
         }

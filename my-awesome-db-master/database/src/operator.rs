@@ -1,8 +1,10 @@
+use std::io::{Read, Write};
+use crate::buffer_pool::BufferPool;
 use crate::row::Row;
 
-pub trait Operator {
+pub trait Operator<R: Read, W: Write> {
     /// Returns the next row from this operator, or None if exhausted.
-    fn next(&mut self) -> Option<Row>;
+    fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row>;
     /// Returns the output schema (column names) of this operator.
     /// This is needed so downstream operators know what columns are available.
     fn schema(&self) -> Vec<String>;

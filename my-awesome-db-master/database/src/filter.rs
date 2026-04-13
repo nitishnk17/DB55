@@ -4,15 +4,17 @@ use common::Data;
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use crate::operator::Operator;
 use crate::row::Row;
+use std::io::{Read, Write};
+use crate::buffer_pool::BufferPool;
 
-pub struct FilterOp {
-    child: Box<dyn Operator>,
+pub struct FilterOp<R: Read, W: Write> {
+    child: Box<dyn Operator<R, W>>,
     predicates: Vec<Predicate>,
     col_index_map: HashMap<String, usize>,
 }
 
-impl FilterOp {
-    pub fn new(child: Box<dyn Operator>, predicates: Vec<Predicate>) -> Self {
+impl<R: Read, W: Write> FilterOp<R, W> {
+    pub fn new(child: Box<dyn Operator<R, W>>, predicates: Vec<Predicate>) -> Self {
         // Build column name → index mapping from the child's schema
         let col_index_map: HashMap<String, usize> = child
             .schema()
@@ -28,10 +30,10 @@ impl FilterOp {
     }
 }
 
-impl Operator for FilterOp {
-    fn next(&mut self) -> Option<Row> {
+impl<R: Read, W: Write> Operator<R, W> for FilterOp<R, W> {
+    fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row> {
         // Keep pulling rows from child until one passes all predicates
-        while let Some(row) = self.child.next() {
+        while let Some(row) = self.child.next(pool) {
             if evaluate_all_predicates(&self.predicates, &row, &self.col_index_map) {
                 return Some(row);
             }
