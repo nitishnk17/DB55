@@ -527,17 +527,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "tests_gen"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "clap",
- "common",
- "monitor_config",
- "serde_json",
-]
-
-[[package]]
 name = "thiserror"
 version = "2.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"

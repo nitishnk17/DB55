@@ -141,8 +141,7 @@ impl<R: Read, W: Write> SortOp<R, W> {
                 buffer_pool.write_block(start_block + i as u64, block_data);
             }
             runs.push(Run {
-                start_block,
-                num_blocks,
+                block_ids: (start_block..start_block+num_blocks).collect(),
                 num_rows: all_rows.len(),
             });
             eprintln!("Sort: wrote run {} ({} rows, {} blocks starting at block {})",
@@ -395,8 +394,7 @@ fn merge_k_runs_to_disk(
     }
 
     Run {
-        start_block,
-        num_blocks,
+        block_ids: (start_block..start_block+num_blocks).collect(),
         num_rows: total_rows,
     }
 }

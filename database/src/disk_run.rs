@@ -7,8 +7,7 @@ use crate::row::{decode_block, encode_row, Row};
 
 #[derive(Clone)]
 pub struct Run {
-    pub start_block: u64,
-    pub num_blocks: u64,
+    pub block_ids: Vec<u64>,
     pub num_rows: usize,
 }
 
@@ -63,9 +62,8 @@ pub fn rows_to_blocks(rows: &[Row], block_size: usize) -> Vec<Vec<u8>> {
 // ─── Run Reader ──────────────────────────────────────────────────────────
 
 pub struct RunReader {
-    pub start_block: u64,
-    pub num_blocks: u64,
-    pub current_block_idx: u64,
+    pub run: Run,
+    pub current_block_idx: usize,
     pub current_row_idx: usize,
     pub current_block_rows: Vec<Row>,
     pub types: Vec<DataType>,
@@ -78,13 +76,17 @@ impl RunReader {
         types: Vec<DataType>,
         buffer_pool: &mut BufferPool<impl Read, impl Write>,
     ) -> Self {
-        let block_data = buffer_pool.fetch_block(run.start_block);
-        buffer_pool.unpin(run.start_block);
-        let rows = decode_block(&block_data, &types);
+        let block_data = if run.block_ids.is_empty() {
+            vec![]
+        } else {
+            let b = buffer_pool.fetch_block(run.block_ids[0]);
+            buffer_pool.unpin(run.block_ids[0]);
+            b
+        };
+        let rows = if run.block_ids.is_empty() { vec![] } else { decode_block(&block_data, &types) };
 
         RunReader {
-            start_block: run.start_block,
-            num_blocks: run.num_blocks,
+            run: run.clone(),
             current_block_idx: 0,
             current_row_idx: 0,
             current_block_rows: rows,
@@ -104,11 +106,11 @@ impl RunReader {
         self.current_row_idx += 1;
         if self.current_row_idx >= self.current_block_rows.len() {
             self.current_block_idx += 1;
-            if self.current_block_idx >= self.num_blocks {
+            if self.current_block_idx >= self.run.block_ids.len() {
                 self.exhausted = true;
                 return;
             }
-            let block_id = self.start_block + self.current_block_idx;
+            let block_id = self.run.block_ids[self.current_block_idx];
             let block_data = buffer_pool.fetch_block(block_id);
             buffer_pool.unpin(block_id);
             self.current_block_rows = decode_block(&block_data, &self.types);

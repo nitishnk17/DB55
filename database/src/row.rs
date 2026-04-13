@@ -70,8 +70,17 @@ impl std::fmt::Display for Row {
 /// - 0.001      -> "0.001"
 /// - 3.14159    -> "3.14159"
 fn format_float(v: f64) -> String {
-    // Use the same precision SQLite uses internally (%.15g)
-    let s = format!("{:.15g}", v);
+    let mut buffer = [0u8; 64];
+    let s = unsafe {
+        let len = libc::snprintf(
+            buffer.as_mut_ptr() as *mut libc::c_char,
+            buffer.len(),
+            b"%.15g\0".as_ptr() as *const libc::c_char,
+            v
+        );
+        std::str::from_utf8_unchecked(&buffer[..len as usize]).to_string()
+    };
+    
     // Ensure there's always a decimal point (SQLite always shows one for REAL)
     if !s.contains('.') && !s.contains('e') && !s.contains('E') {
         format!("{}.0", s)

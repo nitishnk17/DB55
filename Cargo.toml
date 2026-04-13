@@ -10,7 +10,6 @@ members = [
     "configs/db_config",
     "configs/monitor_config",
     "demo_query_printer",
-    "tests_gen",
 ]
 
 resolver = "3"

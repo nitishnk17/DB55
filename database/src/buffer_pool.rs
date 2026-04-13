@@ -98,7 +98,9 @@ impl<R: Read, W: Write> BufferPool<R, W> {
             self.frames[frame_idx].pin_count += 1;
             self.frames[frame_idx].referenced = true;
             if self.policy != EvictionPolicy::CLOCK {
-                // O(1) push — stale duplicates are filtered during eviction
+                if let Some(pos) = self.lru_list.iter().position(|&x| x == frame_idx) {
+                    self.lru_list.remove(pos);
+                }
                 self.lru_list.push_front(frame_idx);
             }
             return self.frames[frame_idx].data.clone();
@@ -114,6 +116,9 @@ impl<R: Read, W: Write> BufferPool<R, W> {
         self.frames[frame_idx].referenced = true;
         self.page_table.insert(block_id, frame_idx);
         if self.policy != EvictionPolicy::CLOCK {
+            if let Some(pos) = self.lru_list.iter().position(|&x| x == frame_idx) {
+                self.lru_list.remove(pos);
+            }
             self.lru_list.push_front(frame_idx);
         }
         self.frames[frame_idx].data.clone()
