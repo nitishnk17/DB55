@@ -1,0 +1,113 @@
+use std::collections::HashMap;
+use std::cmp::Ordering;
+use common::{Data, DataType};
+use common::query::{ComparisionOperator, ComparisionValue, Predicate};
+use crate::operator::Operator;
+use crate::row::Row;
+use std::io::{Read, Write};
+use crate::buffer_pool::BufferPool;
+
+pub struct FilterOp<R: Read, W: Write> {
+    child: Box<dyn Operator<R, W>>,
+    predicates: Vec<Predicate>,
+    col_index_map: HashMap<String, usize>,
+}
+
+impl<R: Read, W: Write> FilterOp<R, W> {
+    pub fn new(child: Box<dyn Operator<R, W>>, predicates: Vec<Predicate>) -> Self {
+        // Build column name → index mapping from the child's schema
+        let col_index_map: HashMap<String, usize> = child
+            .schema()
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.clone(), i))
+            .collect();
+        FilterOp {
+            child,
+            predicates,
+            col_index_map,
+        }
+    }
+}
+
+impl<R: Read, W: Write> Operator<R, W> for FilterOp<R, W> {
+    fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row> {
+        // Keep pulling rows from child until one passes all predicates
+        while let Some(row) = self.child.next(pool) {
+            if evaluate_all_predicates(&self.predicates, &row, &self.col_index_map) {
+                return Some(row);
+            }
+        }
+        None
+    }
+
+    fn schema(&self) -> Vec<String> {
+        // Filter doesn't change the schema — same columns in, same columns out
+        self.child.schema()
+    }
+
+    fn data_types(&self) -> Vec<DataType> {
+        self.child.data_types()
+    }
+}
+
+/// Convert a ComparisionValue (from the query AST) into a Data value
+/// that can be compared against a row's column value.
+fn resolve_value(
+    value: &ComparisionValue,
+    row: &Row,
+    col_index_map: &HashMap<String, usize>,
+) -> Data {
+    match value {
+        ComparisionValue::Column(col_name) => {
+            let idx = col_index_map[col_name];
+            row.values[idx].clone()
+        }
+        ComparisionValue::I32(v) => Data::Int32(*v),
+        ComparisionValue::I64(v) => Data::Int64(*v),
+        ComparisionValue::F32(v) => Data::Float32(*v),
+        ComparisionValue::F64(v) => Data::Float64(*v),
+        ComparisionValue::String(v) => Data::String(v.clone()),
+    }
+}
+
+/// Evaluate a single predicate against a row. Returns true if the row satisfies it.
+fn evaluate_predicate(
+    predicate: &Predicate,
+    row: &Row,
+    col_index_map: &HashMap<String, usize>,
+) -> bool {
+    // Get the left side: the column value from the row
+    let left_idx = col_index_map[&predicate.column_name];
+    let left = &row.values[left_idx];
+
+    // Get the right side: resolve from literal or column reference
+    let right = resolve_value(&predicate.value, row, col_index_map);
+
+    // Compare using the operator
+    match predicate.operator {
+        ComparisionOperator::EQ => left == &right,
+        ComparisionOperator::NE => left != &right,
+        ComparisionOperator::GT => {
+            left.partial_cmp(&right) == Some(Ordering::Greater)
+        }
+        ComparisionOperator::GTE => {
+            matches!(left.partial_cmp(&right), Some(Ordering::Greater | Ordering::Equal))
+        }
+        ComparisionOperator::LT => {
+            left.partial_cmp(&right) == Some(Ordering::Less)
+        }
+        ComparisionOperator::LTE => {
+            matches!(left.partial_cmp(&right), Some(Ordering::Less | Ordering::Equal))
+        }
+    }
+}
+
+/// Evaluate ALL predicates against a row (AND logic). Returns true only if every predicate passes.
+fn evaluate_all_predicates(
+    predicates: &[Predicate],
+    row: &Row,
+    col_index_map: &HashMap<String, usize>,
+) -> bool {
+    predicates.iter().all(|p| evaluate_predicate(p, row, col_index_map))
+}
