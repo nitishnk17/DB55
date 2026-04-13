@@ -88,13 +88,17 @@ impl<R: Read, W: Write> BufferPool<R, W> {
 
     /// Fetch a single block by ID through the LRU cache.
     /// Returns a clone of the block data.
+    ///
+    /// On cache hit we push the frame to the front of the LRU list WITHOUT
+    /// first removing its old entry (O(1) vs the previous O(n) retain).
+    /// Stale duplicates are skipped during eviction scans instead.
     pub fn fetch_block(&mut self, block_id: u64) -> Vec<u8> {
         // Cache hit
         if let Some(&frame_idx) = self.page_table.get(&block_id) {
             self.frames[frame_idx].pin_count += 1;
             self.frames[frame_idx].referenced = true;
             if self.policy != EvictionPolicy::CLOCK {
-                self.lru_list.retain(|&x| x != frame_idx);
+                // O(1) push — stale duplicates are filtered during eviction
                 self.lru_list.push_front(frame_idx);
             }
             return self.frames[frame_idx].data.clone();
@@ -169,28 +173,46 @@ impl<R: Read, W: Write> BufferPool<R, W> {
 
         match self.policy {
             EvictionPolicy::LRU => {
-                for i in (0..self.lru_list.len()).rev() {
-                    let frame_idx = self.lru_list[i];
-                    if self.frames[frame_idx].pin_count == 0 {
-                        evict_pos = Some(i);
-                        frame_idx_to_evict = frame_idx;
+                // Scan from back (least recently used).  Skip stale entries where
+                // the frame has been reassigned to a different block since it was
+                // pushed (duplicates from the O(1) cache-hit push strategy).
+                while let Some(fi) = self.lru_list.pop_back() {
+                    // Stale check: the frame's current block must still map to fi in page_table.
+                    if let Some(blk) = self.frames[fi].block_id {
+                        if self.page_table.get(&blk) != Some(&fi) {
+                            continue; // stale duplicate, skip
+                        }
+                    }
+                    if self.frames[fi].pin_count == 0 {
+                        frame_idx_to_evict = fi;
+                        evict_pos = Some(0); // just to mark found
                         break;
                     }
+                    // Pinned — put it back at front to re-try later
+                    self.lru_list.push_front(fi);
                 }
-                let lru_pos = evict_pos.expect("All frames pinned — buffer pool exhausted!");
-                self.lru_list.remove(lru_pos);
+                if evict_pos.is_none() {
+                    panic!("All frames pinned — buffer pool exhausted!");
+                }
             }
             EvictionPolicy::MRU => {
-                for i in 0..self.lru_list.len() {
-                    let frame_idx = self.lru_list[i];
-                    if self.frames[frame_idx].pin_count == 0 {
-                        evict_pos = Some(i);
-                        frame_idx_to_evict = frame_idx;
+                // Scan from front (most recently used).  Skip stale entries.
+                while let Some(fi) = self.lru_list.pop_front() {
+                    if let Some(blk) = self.frames[fi].block_id {
+                        if self.page_table.get(&blk) != Some(&fi) {
+                            continue; // stale duplicate, skip
+                        }
+                    }
+                    if self.frames[fi].pin_count == 0 {
+                        frame_idx_to_evict = fi;
+                        evict_pos = Some(0);
                         break;
                     }
+                    self.lru_list.push_back(fi);
                 }
-                let mru_pos = evict_pos.expect("All frames pinned — buffer pool exhausted!");
-                self.lru_list.remove(mru_pos);
+                if evict_pos.is_none() {
+                    panic!("All frames pinned — buffer pool exhausted!");
+                }
             }
             EvictionPolicy::CLOCK => {
                 loop {
