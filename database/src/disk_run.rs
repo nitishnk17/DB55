@@ -13,6 +13,12 @@ pub struct Run {
 }
 
 /// Convert rows into block-formatted byte buffers ready for disk writes.
+///
+/// Each block has `block_size - 2` usable bytes for row data, with the last
+/// 2 bytes storing the row count (u16 LE).  A row must fit within a single
+/// block.  If a row is too large, this function panics with a descriptive
+/// message (this should never happen for well-formed table data or join
+/// results within the block-size guarantees of the assignment).
 pub fn rows_to_blocks(rows: &[Row], block_size: usize) -> Vec<Vec<u8>> {
     let usable_space = block_size - 2;
     let mut blocks = Vec::new();
@@ -23,10 +29,19 @@ pub fn rows_to_blocks(rows: &[Row], block_size: usize) -> Vec<Vec<u8>> {
     for row in rows {
         let encoded = encode_row(row);
 
+        assert!(
+            encoded.len() <= usable_space,
+            "Row of {} bytes exceeds block usable space of {} bytes (block_size={}). \
+             This typically means a join produced a row wider than one block.",
+            encoded.len(), usable_space, block_size
+        );
+
         if offset + encoded.len() > usable_space {
-            // Finalize current block
-            current_block[block_size - 2..].copy_from_slice(&row_count.to_le_bytes());
-            blocks.push(current_block);
+            // Finalize current block (only if it has rows — guards against empty flush)
+            if row_count > 0 {
+                current_block[block_size - 2..].copy_from_slice(&row_count.to_le_bytes());
+                blocks.push(current_block);
+            }
             current_block = vec![0u8; block_size];
             offset = 0;
             row_count = 0;

@@ -331,10 +331,12 @@ fn merge_k_runs_to_disk(
 
         // Flush full block to disk
         if offset + encoded.len() > usable_space {
-            current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
-            let blk = buffer_pool.allocate_anon_blocks(1);
-            buffer_pool.write_block(blk, &current_block);
-            num_blocks += 1;
+            if row_count_in_blk > 0 {
+                current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
+                let blk = buffer_pool.allocate_anon_blocks(1);
+                buffer_pool.write_block(blk, &current_block);
+                num_blocks += 1;
+            }
             current_block = vec![0u8; block_size];
             offset = 0;
             row_count_in_blk = 0;
