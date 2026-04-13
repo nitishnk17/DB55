@@ -1,1 +1,13 @@
-.DS_Store
+target/
+**/*.json
+scratch/
+tests_gen/
+**/*.csv
+**/*.schema
+**/*.bin
+assignment3.txt
+learning/
+report.md
+report.pdf
+datasets/
+implementation_plan.md
