@@ -12,16 +12,31 @@ use crate::row::{encode_row, Row};
 
 // ─── SortOp ─────────────────────────────────────────────────────────────────
 
+/// SortOp uses either in-memory sorted rows (small data) or a disk-backed
+/// RunReader (large data after external merge sort) to stream results.
 pub struct SortOp<R: Read, W: Write> {
+    /// In-memory path: all rows sorted and stored here.
     sorted_rows: Vec<Row>,
     current_index: usize,
+    /// External sort path: final merged run on disk, read via RunReader.
+    final_run_reader: Option<RunReader>,
     output_schema: Vec<String>,
     output_specs: Vec<ColumnSpec>,
     _marker: std::marker::PhantomData<(R, W)>,
 }
 
 impl<R: Read, W: Write> Operator<R, W> for SortOp<R, W> {
-    fn next(&mut self, _pool: &mut BufferPool<R, W>) -> Option<Row> {
+    fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row> {
+        // External sort path: stream from the final merged run on disk
+        if let Some(reader) = &mut self.final_run_reader {
+            if let Some(row) = reader.peek() {
+                let row = row.clone();
+                reader.advance(pool);
+                return Some(row);
+            }
+            return None;
+        }
+        // In-memory path
         if self.current_index < self.sorted_rows.len() {
             let row = self.sorted_rows[self.current_index].clone();
             self.current_index += 1;
@@ -99,6 +114,7 @@ impl<R: Read, W: Write> SortOp<R, W> {
             return SortOp {
                 sorted_rows: all_rows,
                 current_index: 0,
+                final_run_reader: None,
                 output_schema,
                 output_specs: column_specs,
                 _marker: std::marker::PhantomData,
@@ -148,8 +164,10 @@ impl<R: Read, W: Write> SortOp<R, W> {
 
         eprintln!("Sort: {} runs generated, starting merge", runs.len());
 
-        // Multi-pass K-way merge
-        let sorted_rows = merge_all_runs(
+        // Multi-pass K-way merge — merge all runs down to a single sorted run
+        // on disk, then stream results via RunReader to avoid loading all rows
+        // into memory (which would blow the 64 MB RLIMIT_AS budget).
+        let final_run = merge_all_runs_to_disk(
             runs,
             &sort_keys,
             &column_specs,
@@ -157,11 +175,13 @@ impl<R: Read, W: Write> SortOp<R, W> {
             block_size,
         );
 
-        eprintln!("Sort: merge complete, {} rows in output", sorted_rows.len());
+        eprintln!("Sort: merge complete, {} rows in final run on disk", final_run.num_rows);
 
+        let reader = RunReader::new(&final_run, column_specs.clone(), buffer_pool);
         SortOp {
-            sorted_rows,
+            sorted_rows: Vec::new(),
             current_index: 0,
+            final_run_reader: Some(reader),
             output_schema,
             output_specs: column_specs,
             _marker: std::marker::PhantomData,
@@ -254,18 +274,25 @@ impl Ord for HeapEntry {
 
 // ─── K-Way Merge Controller ──────────────────────────────────────────────────
 
-fn merge_all_runs(
+/// Merge all runs down to a single sorted Run on disk.
+/// Uses multi-pass K-way merge with max_fanout runs per pass.
+fn merge_all_runs_to_disk(
     mut runs: Vec<Run>,
     sort_keys: &[(usize, bool)],
     column_specs: &[ColumnSpec],
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
     block_size: usize,
-) -> Vec<Row> {
-    // Merge at most max_fanout runs per pass; repeat until we have ≤ max_fanout
+) -> Run {
     let max_fanout = 128;
 
-    while runs.len() > max_fanout {
-        eprintln!("Sort: intermediate merge pass ({} runs → chunks of {})", runs.len(), max_fanout);
+    // If there's only one run, it's already sorted — return it directly.
+    if runs.len() == 1 {
+        return runs.into_iter().next().unwrap();
+    }
+
+    // Merge passes until we have a single run
+    while runs.len() > 1 {
+        eprintln!("Sort: merge pass ({} runs → chunks of {})", runs.len(), max_fanout);
         let mut next_pass_runs = Vec::new();
 
         for chunk in runs.chunks(max_fanout) {
@@ -285,7 +312,7 @@ fn merge_all_runs(
         runs = next_pass_runs;
     }
 
-    merge_k_runs_to_vec(&runs, sort_keys, column_specs, buffer_pool)
+    runs.into_iter().next().unwrap()
 }
 
 fn merge_k_runs_to_disk(
@@ -375,48 +402,5 @@ fn merge_k_runs_to_disk(
     }
 }
 
-fn merge_k_runs_to_vec(
-    runs: &[Run],
-    sort_keys: &[(usize, bool)],
-    column_specs: &[ColumnSpec],
-    buffer_pool: &mut BufferPool<impl Read, impl Write>,
-) -> Vec<Row> {
-    let mut readers: Vec<RunReader> = runs
-        .iter()
-        .map(|run| RunReader::new(run, column_specs.to_vec(), buffer_pool))
-        .collect();
-
-    // Wrap sort_keys in Arc so all HeapEntries share one allocation.
-    let arc_keys = Arc::new(sort_keys.to_vec());
-
-    let mut heap = BinaryHeap::new();
-    for (i, reader) in readers.iter().enumerate() {
-        if let Some(row) = reader.peek() {
-            heap.push(HeapEntry {
-                row: row.clone(),
-                run_index: i,
-                sort_keys: Arc::clone(&arc_keys),
-            });
-        }
-    }
-
-    let total_rows: usize = runs.iter().map(|r| r.num_rows).sum();
-    let mut result = Vec::with_capacity(total_rows);
-
-    while let Some(entry) = heap.pop() {
-        result.push(entry.row);
-
-        let reader = &mut readers[entry.run_index];
-        let run_index = entry.run_index;
-        reader.advance(buffer_pool);
-        if let Some(next_row) = reader.peek() {
-            heap.push(HeapEntry {
-                row: next_row.clone(),
-                run_index,
-                sort_keys: Arc::clone(&arc_keys),
-            });
-        }
-    }
-
-    result
-}
+// merge_k_runs_to_vec removed — the final merge now always writes to disk
+// and results are streamed via RunReader to avoid materializing all rows in memory.
