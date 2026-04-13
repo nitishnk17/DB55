@@ -10,6 +10,7 @@ pub struct CrossOp<R: Read, W: Write> {
     current_left_row: Option<Row>, // the current left row we're pairing with
     right_index: usize,            // which right row we're currently at
     output_schema: Vec<String>,    // concatenation of left + right schemas
+    output_specs: Vec<db_config::table::ColumnSpec>,
 }
 
 impl<R: Read, W: Write> CrossOp<R, W> {
@@ -20,6 +21,9 @@ impl<R: Read, W: Write> CrossOp<R, W> {
         let right_schema = right.schema();
         let mut output_schema = left_schema;
         output_schema.extend(right_schema);
+
+        let mut output_specs = left.column_specs();
+        output_specs.extend(right.column_specs());
 
         // 2. Materialize the right child: drain all rows into a Vec
         let mut right_rows = Vec::new();
@@ -35,6 +39,7 @@ impl<R: Read, W: Write> CrossOp<R, W> {
             current_left_row,
             right_index: 0,
             output_schema,
+            output_specs,
         }
     }
 }
@@ -69,5 +74,9 @@ impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
 
     fn schema(&self) -> Vec<String> {
         self.output_schema.clone()
+    }
+
+    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
+        self.output_specs.clone()
     }
 }

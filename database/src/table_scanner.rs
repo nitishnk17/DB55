@@ -77,4 +77,8 @@ impl<R: Read, W: Write> Operator<R, W> for TableScanner {
     fn schema(&self) -> Vec<String> {
         self.column_names.clone()
     }
+
+    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
+        self.column_specs.clone()
+    }
 }

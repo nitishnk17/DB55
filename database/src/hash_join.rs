@@ -29,6 +29,8 @@ pub struct HashJoinOp<R: Read, W: Write> {
     current_index: usize,
     /// Output schema = left_schema ++ right_schema.
     output_schema: Vec<String>,
+    /// Full column specs for output columns.
+    output_specs: Vec<ColumnSpec>,
     _marker: std::marker::PhantomData<(R, W)>,
 }
 
@@ -180,6 +182,9 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
         let mut output_schema = left.schema();
         output_schema.extend(right.schema());
 
+        let mut output_specs = left.column_specs();
+        output_specs.extend(right.column_specs());
+
         // Number of partitions — 64 is a reasonable default.
         // For very large tables this keeps each partition small enough
         // to fit an in-memory hash table within the 64 MB budget.
@@ -244,6 +249,7 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
             joined_rows,
             current_index: 0,
             output_schema,
+            output_specs,
             _marker: std::marker::PhantomData,
         }
     }
@@ -264,5 +270,9 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
 
     fn schema(&self) -> Vec<String> {
         self.output_schema.clone()
+    }
+
+    fn column_specs(&self) -> Vec<ColumnSpec> {
+        self.output_specs.clone()
     }
 }

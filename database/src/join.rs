@@ -9,6 +9,7 @@ pub struct JoinOp<R: Read, W: Write> {
     joined_rows: Vec<Row>,
     current_index: usize,
     output_schema: Vec<String>,
+    output_specs: Vec<db_config::table::ColumnSpec>,
     _marker: std::marker::PhantomData<(R, W)>,
 }
 
@@ -24,6 +25,9 @@ impl<R: Read, W: Write> JoinOp<R, W> {
         // Output schema
         let mut output_schema = left.schema();
         output_schema.extend(right.schema());
+
+        let mut output_specs = left.column_specs();
+        output_specs.extend(right.column_specs());
 
         // 1. Materialize the right child entirely into anonymous blocks
         let mut right_rows = Vec::new();
@@ -98,6 +102,7 @@ impl<R: Read, W: Write> JoinOp<R, W> {
             joined_rows,
             current_index: 0,
             output_schema,
+            output_specs,
             _marker: std::marker::PhantomData,
         }
     }
@@ -116,5 +121,9 @@ impl<R: Read, W: Write> Operator<R, W> for JoinOp<R, W> {
 
     fn schema(&self) -> Vec<String> {
         self.output_schema.clone()
+    }
+
+    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
+        self.output_specs.clone()
     }
 }

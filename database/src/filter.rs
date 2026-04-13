@@ -45,6 +45,10 @@ impl<R: Read, W: Write> Operator<R, W> for FilterOp<R, W> {
         // Filter doesn't change the schema — same columns in, same columns out
         self.child.schema()
     }
+
+    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
+        self.child.column_specs()
+    }
 }
 
 /// Convert a ComparisionValue (from the query AST) into a Data value

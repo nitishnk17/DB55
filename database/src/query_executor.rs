@@ -148,9 +148,12 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                                             (l_actual_schema.iter().position(|x| x == col_b).unwrap(),
                                              right_schema.iter().position(|x| x == &col_a).unwrap())
                                         };
-                                        let lcs = resolve_column_specs(&l_actual_schema, ctx);
-                                        let rcs = resolve_column_specs(&right_schema, ctx);
-                                        
+                                        // Use column_specs() from the operators directly — avoids
+                                        // the fragile reverse-lookup in resolve_column_specs which
+                                        // could silently default to String for unrecognized names.
+                                        let lcs = current_op.column_specs();
+                                        let rcs = right_op.column_specs();
+
                                         current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
                                             eprintln!("Join strategy: Grace Hash Join (Setting LRU cache)");
                                             buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::LRU);
@@ -210,8 +213,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
 
         QueryOp::Sort(sort_data) => {
             let child = build_operator_internal(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
-            let child_schema  = child.schema();
-            let column_specs  = resolve_column_specs(&child_schema, ctx);
+            let column_specs  = child.column_specs();
             Box::new(SortOp::new(
                 child,
                 sort_data.sort_specs.clone(),

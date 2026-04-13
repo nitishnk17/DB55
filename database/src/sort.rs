@@ -16,6 +16,7 @@ pub struct SortOp<R: Read, W: Write> {
     sorted_rows: Vec<Row>,
     current_index: usize,
     output_schema: Vec<String>,
+    output_specs: Vec<ColumnSpec>,
     _marker: std::marker::PhantomData<(R, W)>,
 }
 
@@ -32,6 +33,10 @@ impl<R: Read, W: Write> Operator<R, W> for SortOp<R, W> {
 
     fn schema(&self) -> Vec<String> {
         self.output_schema.clone()
+    }
+
+    fn column_specs(&self) -> Vec<ColumnSpec> {
+        self.output_specs.clone()
     }
 }
 
@@ -95,6 +100,7 @@ impl<R: Read, W: Write> SortOp<R, W> {
                 sorted_rows: all_rows,
                 current_index: 0,
                 output_schema,
+                output_specs: column_specs,
                 _marker: std::marker::PhantomData,
             };
         }
@@ -157,6 +163,7 @@ impl<R: Read, W: Write> SortOp<R, W> {
             sorted_rows,
             current_index: 0,
             output_schema,
+            output_specs: column_specs,
             _marker: std::marker::PhantomData,
         }
     }
