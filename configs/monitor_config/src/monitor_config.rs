@@ -6,8 +6,8 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Deserialize, Serialize)]
 pub struct MonitorConfig {
-    disk_config: DiskConfig,
-    database_config: DatabaseConfig,
+    pub disk_config: DiskConfig,
+    pub database_config: DatabaseConfig,
     pub query_configs: Vec<QueryConfig>,
 }
 

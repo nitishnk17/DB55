@@ -6,9 +6,9 @@ use crate::operator::Operator;
 use crate::project::ProjectOp;
 use crate::sort::SortOp;
 use crate::table_scanner::TableScanner;
-use common::query::QueryOp;
+use common::query::{ComparisionOperator, ComparisionValue, Predicate, QueryOp};
+use common::DataType;
 use db_config::statistics::{CardinalityData, ColumnStat};
-use db_config::table::ColumnSpec;
 use db_config::DbContext;
 use std::io::{Read, Write};
 
@@ -43,7 +43,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
             Box::new(TableScanner::new(
                 buffer_pool,
                 &table_spec.file_id,
-                table_spec.column_specs.clone(),
+                &table_spec.column_specs,
             ))
         }
 
@@ -53,10 +53,14 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
             // (possibly nested) is a multi-way join.
             // First, collect ALL predicates from consecutive Filter nodes above
             // the Cross, so that join predicates in outer Filters are not missed.
-            let mut all_filter_predicates = filter_data.predicates.clone();
+            let mut all_filter_predicates: Vec<Predicate> = filter_data
+                .predicates
+                .iter()
+                .map(|p| clone_predicate(p))
+                .collect();
             let mut innermost: &QueryOp = &*filter_data.underlying;
             while let QueryOp::Filter(inner_f) = innermost {
-                all_filter_predicates.extend(inner_f.predicates.clone());
+                all_filter_predicates.extend(inner_f.predicates.iter().map(|p| clone_predicate(p)));
                 innermost = &*inner_f.underlying;
             }
 
@@ -71,8 +75,8 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                 // Partition predicates into:
                 //   scalar_preds[i] = predicates that only reference columns from leaf i
                 //   remaining_preds  = join predicates + multi-table predicates
-                let mut remaining_preds: Vec<common::query::Predicate> = Vec::new();
-                let mut scalar_preds: Vec<Vec<common::query::Predicate>> =
+                let mut remaining_preds: Vec<Predicate> = Vec::new();
+                let mut scalar_preds: Vec<Vec<Predicate>> =
                     (0..leaves.len()).map(|_| Vec::new()).collect();
 
                 for p in &all_filter_predicates {
@@ -81,7 +85,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                     let col_a = &p.column_name;
                     let owner_a = leaf_schemas.iter().position(|s| s.contains(col_a));
                     let is_scalar = match &p.value {
-                        common::query::ComparisionValue::Column(col_b) => {
+                        ComparisionValue::Column(col_b) => {
                             // Both columns in same leaf → scalar (intra-table)
                             match leaf_schemas.iter().position(|s| s.contains(col_b)) {
                                 Some(o_b) => owner_a == Some(o_b),
@@ -91,9 +95,9 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                         _ => owner_a.is_some(), // literal comparison → scalar for that leaf
                     };
                     if is_scalar {
-                        scalar_preds[owner_a.unwrap()].push(p.clone());
+                        scalar_preds[owner_a.unwrap()].push(clone_predicate(p));
                     } else {
-                        remaining_preds.push(p.clone());
+                        remaining_preds.push(clone_predicate(p));
                     }
                 }
 
@@ -127,50 +131,51 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                         if joined[leaf_idx] { continue; }
                         let new_schema = &leaf_schemas[leaf_idx];
                         for pred_idx in 0..remaining_preds.len() {
-                            if let common::query::ComparisionOperator::EQ = remaining_preds[pred_idx].operator {
-                                if let common::query::ComparisionValue::Column(col_b) = &remaining_preds[pred_idx].value.clone() {
-                                    let col_a = remaining_preds[pred_idx].column_name.clone();
-                                    let a_cur = current_schema.contains(&col_a);
-                                    let b_new = new_schema.contains(col_b);
-                                    let b_cur = current_schema.contains(col_b);
-                                    let a_new = new_schema.contains(&col_a);
-                                    if (a_cur && b_new) || (b_cur && a_new) {
-                                        // Build this leaf with its pushed-down scalar preds
-                                        let right_op = build_leaf_with_filter(
-                                            leaves[leaf_idx], &scalar_preds[leaf_idx], &global_needed,
-                                            ctx, buffer_pool, sort_memory_bytes);
-                                        let right_schema = right_op.schema();
-                                        let l_actual_schema = current_op.schema();
-                                        let (l_idx, r_idx) = if a_cur && b_new {
-                                            (l_actual_schema.iter().position(|x| x == &col_a).unwrap(),
-                                             right_schema.iter().position(|x| x == col_b).unwrap())
-                                        } else {
-                                            (l_actual_schema.iter().position(|x| x == col_b).unwrap(),
-                                             right_schema.iter().position(|x| x == &col_a).unwrap())
-                                        };
-                                        // Use column_specs() from the operators directly — avoids
-                                        // the fragile reverse-lookup in resolve_column_specs which
-                                        // could silently default to String for unrecognized names.
-                                        let lcs = current_op.column_specs();
-                                        let rcs = right_op.column_specs();
+                            let is_eq = matches!(remaining_preds[pred_idx].operator, ComparisionOperator::EQ);
+                            if !is_eq { continue; }
+                            // Extract column names without borrowing remaining_preds across remove()
+                            let col_a = remaining_preds[pred_idx].column_name.clone();
+                            let col_b_opt = match &remaining_preds[pred_idx].value {
+                                ComparisionValue::Column(c) => Some(c.clone()),
+                                _ => None,
+                            };
+                            if let Some(col_b) = col_b_opt {
+                                let a_cur = current_schema.contains(&col_a);
+                                let b_new = new_schema.contains(&col_b);
+                                let b_cur = current_schema.contains(&col_b);
+                                let a_new = new_schema.contains(&col_a);
+                                if (a_cur && b_new) || (b_cur && a_new) {
+                                    // Build this leaf with its pushed-down scalar preds
+                                    let right_op = build_leaf_with_filter(
+                                        leaves[leaf_idx], &scalar_preds[leaf_idx], &global_needed,
+                                        ctx, buffer_pool, sort_memory_bytes);
+                                    let right_schema = right_op.schema();
+                                    let l_actual_schema = current_op.schema();
+                                    let (l_idx, r_idx) = if a_cur && b_new {
+                                        (l_actual_schema.iter().position(|x| x == &col_a).unwrap(),
+                                         right_schema.iter().position(|x| x == &col_b).unwrap())
+                                    } else {
+                                        (l_actual_schema.iter().position(|x| x == &col_b).unwrap(),
+                                         right_schema.iter().position(|x| x == &col_a).unwrap())
+                                    };
+                                    // Use data_types() from the operators directly
+                                    let ldt = current_op.data_types();
+                                    let rdt = right_op.data_types();
 
-                                        current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
-                                            eprintln!("Join strategy: Grace Hash Join (Setting LRU cache)");
-                                            buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::LRU);
-                                            Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, lcs, rcs, buffer_pool))
-                                        } else {
-                                            // Implement adaptive dynamic eviction: nested loops benefit immensely from MRU
-                                            // to prevent sequential flooding of the outer loop over inner data
-                                            eprintln!("Join strategy: Block Nested Loop Join (Setting MRU cache)");
-                                            buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::MRU);
-                                            Box::new(crate::join::JoinOp::new(current_op, right_op, l_idx, r_idx, rcs, buffer_pool))
-                                        };
-                                        current_schema.extend(right_schema);
-                                        joined[leaf_idx] = true;
-                                        remaining_preds.remove(pred_idx);
-                                        found = true;
-                                        break 'search;
-                                    }
+                                    current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
+                                        eprintln!("Join strategy: Grace Hash Join (Setting LRU cache)");
+                                        buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::LRU);
+                                        Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, ldt, rdt, buffer_pool))
+                                    } else {
+                                        eprintln!("Join strategy: Block Nested Loop Join (Setting MRU cache)");
+                                        buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::MRU);
+                                        Box::new(crate::join::JoinOp::new(current_op, right_op, l_idx, r_idx, rdt, buffer_pool))
+                                    };
+                                    current_schema.extend(right_schema);
+                                    joined[leaf_idx] = true;
+                                    remaining_preds.remove(pred_idx);
+                                    found = true;
+                                    break 'search;
                                 }
                             }
                         }
@@ -197,7 +202,8 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
 
             // Standard filter (no join rewrite)
             let child = build_operator_internal(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
-            Box::new(FilterOp::new(child, filter_data.predicates.clone()))
+            let preds = filter_data.predicates.iter().map(|p| clone_predicate(p)).collect();
+            Box::new(FilterOp::new(child, preds))
         }
 
         QueryOp::Project(project_data) => {
@@ -213,63 +219,54 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
 
         QueryOp::Sort(sort_data) => {
             let child = build_operator_internal(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
-            let column_specs  = child.column_specs();
+            let data_types = child.data_types();
             Box::new(SortOp::new(
                 child,
-                sort_data.sort_specs.clone(),
-                column_specs,
+                &sort_data.sort_specs,
+                data_types,
                 buffer_pool,
-                sort_memory_bytes,   // ← pass the real budget
+                sort_memory_bytes,
             ))
         }
     }
 }
 
-// ─── Helpers ─────────────────────────────────────────────────────────────────
+// ─── Manual Clone Helpers ───────────────────────────────────────────────────
+// These exist because the common/ crate types (Predicate, ComparisionOperator,
+// ComparisionValue) don't derive Clone.  We reconstruct them field-by-field
+// using only types that DO have Clone (String, i32, f32, etc.).
 
-/// Look up the ColumnSpec (DataType + stats) for each column name in the schema
-/// by scanning all tables in the context.
-///
-/// For aliased columns like "l1.l_orderkey", we first try the full name, then
-/// strip the alias prefix (everything before the first '.') and try the base name.
-fn resolve_column_specs(schema: &[String], ctx: &DbContext) -> Vec<ColumnSpec> {
-    schema
-        .iter()
-        .map(|col_name| {
-            // Try exact match first
-            for table in ctx.get_table_specs() {
-                for cs in &table.column_specs {
-                    if cs.column_name == *col_name {
-                        return cs.clone();
-                    }
-                }
-            }
-            // Try stripping alias prefix (e.g. "l1.l_orderkey" → "l_orderkey")
-            if let Some(dot_pos) = col_name.find('.') {
-                let base_name = &col_name[dot_pos + 1..];
-                for table in ctx.get_table_specs() {
-                    for cs in &table.column_specs {
-                        if cs.column_name == base_name {
-                            return ColumnSpec {
-                                column_name: col_name.clone(),
-                                data_type: cs.data_type.clone(),
-                                stats: cs.stats.clone(),
-                            };
-                        }
-                    }
-                }
-            }
-            // Fallback: create a synthetic String spec so the code doesn't panic on
-            // computed / renamed columns that don't appear in any base table.
-            eprintln!("Warning: column '{}' not found in any table spec; defaulting to String", col_name);
-            ColumnSpec {
-                column_name: col_name.clone(),
-                data_type: common::DataType::String,
-                stats: None,
-            }
-        })
-        .collect()
+fn clone_predicate(p: &Predicate) -> Predicate {
+    Predicate {
+        column_name: p.column_name.clone(),
+        operator: clone_cmp_op(&p.operator),
+        value: clone_cmp_value(&p.value),
+    }
 }
+
+fn clone_cmp_op(op: &ComparisionOperator) -> ComparisionOperator {
+    match op {
+        ComparisionOperator::EQ  => ComparisionOperator::EQ,
+        ComparisionOperator::NE  => ComparisionOperator::NE,
+        ComparisionOperator::GT  => ComparisionOperator::GT,
+        ComparisionOperator::GTE => ComparisionOperator::GTE,
+        ComparisionOperator::LT  => ComparisionOperator::LT,
+        ComparisionOperator::LTE => ComparisionOperator::LTE,
+    }
+}
+
+fn clone_cmp_value(v: &ComparisionValue) -> ComparisionValue {
+    match v {
+        ComparisionValue::Column(s) => ComparisionValue::Column(s.clone()),
+        ComparisionValue::I32(n)    => ComparisionValue::I32(*n),
+        ComparisionValue::I64(n)    => ComparisionValue::I64(*n),
+        ComparisionValue::F32(n)    => ComparisionValue::F32(*n),
+        ComparisionValue::F64(n)    => ComparisionValue::F64(*n),
+        ComparisionValue::String(s) => ComparisionValue::String(s.clone()),
+    }
+}
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
 
 /// Decide between Grace Hash Join and BNLJ based on cardinality statistics.
 ///
@@ -304,7 +301,7 @@ fn get_all_used_columns(query: &QueryOp) -> std::collections::HashSet<String> {
             cols.extend(get_all_used_columns(&f.underlying));
             for p in &f.predicates {
                 cols.insert(p.column_name.clone());
-                if let common::query::ComparisionValue::Column(c) = &p.value {
+                if let ComparisionValue::Column(c) = &p.value {
                     cols.insert(c.clone());
                 }
             }
@@ -330,31 +327,32 @@ fn get_all_used_columns(query: &QueryOp) -> std::collections::HashSet<String> {
 }
 
 
-/// Build a leaf operator, wrapping it in a FilterOp if there are pushed-down predicates, 
+/// Build a leaf operator, wrapping it in a FilterOp if there are pushed-down predicates,
 /// and finally a ProjectOp limiting it to the globally required columns.
 fn build_leaf_with_filter<R: Read + 'static, W: Write + 'static>(
     leaf: &QueryOp,
-    scalar_preds: &[common::query::Predicate],
+    scalar_preds: &[Predicate],
     global_needed: &std::collections::HashSet<String>,
     ctx: &DbContext,
     buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
 ) -> Box<dyn Operator<R, W>> {
     let mut op = build_operator_internal(leaf, ctx, buffer_pool, sort_memory_bytes, global_needed);
-    
+
     if !scalar_preds.is_empty() {
-        op = Box::new(FilterOp::new(op, scalar_preds.to_vec()));
+        let preds: Vec<Predicate> = scalar_preds.iter().map(|p| clone_predicate(p)).collect();
+        op = Box::new(FilterOp::new(op, preds));
     }
 
     let current_schema = op.schema();
-    
+
     // Project pushdown: Keep only columns requested globally that are present in the current schema
     let needed_here: Vec<(String, String)> = current_schema
         .into_iter()
         .filter(|c| global_needed.contains(c))
         .map(|c| (c.clone(), c))
         .collect();
-        
+
     // Only wrap with ProjectOp if it actually restricts columns
     if !needed_here.is_empty() && needed_here.len() < op.schema().len() {
         op = Box::new(ProjectOp::new(op, needed_here));
@@ -395,6 +393,34 @@ fn schema_of(op: &QueryOp, ctx: &DbContext) -> Vec<String> {
         }
         QueryOp::Sort(s) => schema_of(&s.underlying, ctx),
     }
+}
+
+/// Look up the DataType for a column name by scanning all tables in the context.
+/// Used as a fallback when we need type info from the catalog.
+#[allow(dead_code)]
+fn resolve_data_type(col_name: &str, ctx: &DbContext) -> DataType {
+    // Try exact match first
+    for table in ctx.get_table_specs() {
+        for cs in &table.column_specs {
+            if cs.column_name == col_name {
+                return cs.data_type.clone();
+            }
+        }
+    }
+    // Try stripping alias prefix (e.g. "l1.l_orderkey" → "l_orderkey")
+    if let Some(dot_pos) = col_name.find('.') {
+        let base_name = &col_name[dot_pos + 1..];
+        for table in ctx.get_table_specs() {
+            for cs in &table.column_specs {
+                if cs.column_name == base_name {
+                    return cs.data_type.clone();
+                }
+            }
+        }
+    }
+    // Fallback: default to String
+    eprintln!("Warning: column '{}' not found in any table spec; defaulting to String", col_name);
+    DataType::String
 }
 
 /// Return the first CardinailtyData value found for any column in the schema.

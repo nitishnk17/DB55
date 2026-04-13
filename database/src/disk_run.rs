@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
+use common::DataType;
 use crate::buffer_pool::BufferPool;
 use crate::row::{decode_block, encode_row, Row};
-use db_config::table::ColumnSpec;
 
 // ─── Run Management ──────────────────────────────────────────────────────
 
@@ -68,19 +68,19 @@ pub struct RunReader {
     pub current_block_idx: u64,
     pub current_row_idx: usize,
     pub current_block_rows: Vec<Row>,
-    pub schema: Vec<ColumnSpec>,
+    pub types: Vec<DataType>,
     pub exhausted: bool,
 }
 
 impl RunReader {
     pub fn new(
         run: &Run,
-        schema: Vec<ColumnSpec>,
+        types: Vec<DataType>,
         buffer_pool: &mut BufferPool<impl Read, impl Write>,
     ) -> Self {
         let block_data = buffer_pool.fetch_block(run.start_block);
         buffer_pool.unpin(run.start_block);
-        let rows = decode_block(&block_data, &schema);
+        let rows = decode_block(&block_data, &types);
 
         RunReader {
             start_block: run.start_block,
@@ -88,7 +88,7 @@ impl RunReader {
             current_block_idx: 0,
             current_row_idx: 0,
             current_block_rows: rows,
-            schema,
+            types,
             exhausted: run.num_rows == 0,
         }
     }
@@ -111,7 +111,7 @@ impl RunReader {
             let block_id = self.start_block + self.current_block_idx;
             let block_data = buffer_pool.fetch_block(block_id);
             buffer_pool.unpin(block_id);
-            self.current_block_rows = decode_block(&block_data, &self.schema);
+            self.current_block_rows = decode_block(&block_data, &self.types);
             self.current_row_idx = 0;
         }
     }

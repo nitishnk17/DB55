@@ -1,6 +1,7 @@
 use crate::operator::Operator;
 use crate::row::Row;
 
+use common::DataType;
 use std::io::{Read, Write};
 use crate::buffer_pool::BufferPool;
 
@@ -10,7 +11,7 @@ pub struct CrossOp<R: Read, W: Write> {
     current_left_row: Option<Row>, // the current left row we're pairing with
     right_index: usize,            // which right row we're currently at
     output_schema: Vec<String>,    // concatenation of left + right schemas
-    output_specs: Vec<db_config::table::ColumnSpec>,
+    output_types: Vec<DataType>,
 }
 
 impl<R: Read, W: Write> CrossOp<R, W> {
@@ -22,8 +23,8 @@ impl<R: Read, W: Write> CrossOp<R, W> {
         let mut output_schema = left_schema;
         output_schema.extend(right_schema);
 
-        let mut output_specs = left.column_specs();
-        output_specs.extend(right.column_specs());
+        let mut output_types = left.data_types();
+        output_types.extend(right.data_types());
 
         // 2. Materialize the right child: drain all rows into a Vec
         let mut right_rows = Vec::new();
@@ -39,7 +40,7 @@ impl<R: Read, W: Write> CrossOp<R, W> {
             current_left_row,
             right_index: 0,
             output_schema,
-            output_specs,
+            output_types,
         }
     }
 }
@@ -76,7 +77,7 @@ impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
         self.output_schema.clone()
     }
 
-    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
-        self.output_specs.clone()
+    fn data_types(&self) -> Vec<DataType> {
+        self.output_types.clone()
     }
 }

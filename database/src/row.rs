@@ -1,16 +1,15 @@
 use common::{Data, DataType};
-use db_config::table::ColumnSpec;
 
 #[derive(Debug, Clone)]
 pub struct Row{
     pub values: Vec<Data>,
 }
 
-pub fn decode_row(bytes: &[u8], schema: &[ColumnSpec]) -> (Row, usize){
+pub fn decode_row(bytes: &[u8], types: &[DataType]) -> (Row, usize){
     let mut values = Vec::new();
     let mut offset = 0;
-    for col in schema {
-        match col.data_type {
+    for dt in types {
+        match dt {
             DataType::Int32 => {
                 let val = i32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap());
                 values.push(Data::Int32(val));
@@ -81,26 +80,16 @@ fn format_float(v: f64) -> String {
     }
 }
 
-pub fn decode_block(block_data: &[u8], schema: &[ColumnSpec]) -> Vec<Row> {
-    // Read the row count from the footer:
-    // The last 2 bytes of the block contain the row count as a u16 in little-endian.
-    // let row_count = u16::from_le_bytes(block_data[block_data.len()-2..].try_into().unwrap());
-    // Iterate and decode rows:
-    // Start at byte offset 0.
-    // Loop row_count times:
-    // Call decode_row(&block_data[offset..], schema) → get (row, bytes_consumed).
-    // Push row into a Vec<Row>.
-    // Advance offset += bytes_consumed.
-    // Return the vector of rows.
+pub fn decode_block(block_data: &[u8], types: &[DataType]) -> Vec<Row> {
     let row_count = u16::from_le_bytes(block_data[block_data.len()-2..].try_into().unwrap());
     let mut rows = Vec::new();
     let mut offset = 0;
     for _ in 0..row_count {
-        let (row, row_len) = decode_row(&block_data[offset..], schema);
+        let (row, row_len) = decode_row(&block_data[offset..], types);
         rows.push(row);
         offset += row_len;
     }
-    rows    
+    rows
 }
 
 pub fn encode_row(row: &Row) -> Vec<u8> {

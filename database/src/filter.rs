@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::cmp::Ordering;
-use common::Data;
+use common::{Data, DataType};
 use common::query::{ComparisionOperator, ComparisionValue, Predicate};
 use crate::operator::Operator;
 use crate::row::Row;
@@ -46,8 +46,8 @@ impl<R: Read, W: Write> Operator<R, W> for FilterOp<R, W> {
         self.child.schema()
     }
 
-    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
-        self.child.column_specs()
+    fn data_types(&self) -> Vec<DataType> {
+        self.child.data_types()
     }
 }
 

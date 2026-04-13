@@ -2,6 +2,7 @@ use crate::operator::Operator;
 use crate::row::Row;
 use std::collections::HashMap;
 
+use common::DataType;
 use std::io::{Read, Write};
 use crate::buffer_pool::BufferPool;
 
@@ -11,15 +12,15 @@ pub struct ProjectOp<R: Read, W: Write> {
     input_indices: Vec<usize>,
     /// The output column names (the "to" names from column_name_map)
     output_schema: Vec<String>,
-    /// Full column specs for the projected output columns
-    output_specs: Vec<db_config::table::ColumnSpec>,
+    /// Data types for the projected output columns
+    output_types: Vec<DataType>,
 }
 
 impl<R: Read, W: Write> ProjectOp<R, W> {
     pub fn new(child: Box<dyn Operator<R, W>>, column_name_map: Vec<(String, String)>) -> Self {
         // Build a lookup from the child's schema: column_name → index
         let child_schema = child.schema();
-        let child_specs = child.column_specs();
+        let child_types = child.data_types();
         let name_to_idx: HashMap<String, usize> = child_schema
             .iter()
             .enumerate()
@@ -32,7 +33,7 @@ impl<R: Read, W: Write> ProjectOp<R, W> {
         //   - Store `to` in `output_schema`
         let mut input_indices = Vec::new();
         let mut output_schema = Vec::new();
-        let mut output_specs = Vec::new();
+        let mut output_types = Vec::new();
 
         for (from_name, to_name) in &column_name_map {
             let idx = *name_to_idx
@@ -40,17 +41,14 @@ impl<R: Read, W: Write> ProjectOp<R, W> {
                 .expect(&format!("Project pushdown failed: could not find {} in child schema", from_name));
             input_indices.push(idx);
             output_schema.push(to_name.clone());
-            // Carry the child's ColumnSpec but with the renamed output name
-            let mut spec = child_specs[idx].clone();
-            spec.column_name = to_name.clone();
-            output_specs.push(spec);
+            output_types.push(child_types[idx].clone());
         }
 
         ProjectOp {
             child,
             input_indices,
             output_schema,
-            output_specs,
+            output_types,
         }
     }
 }
@@ -74,7 +72,7 @@ impl<R: Read, W: Write> Operator<R, W> for ProjectOp<R, W> {
         self.output_schema.clone()
     }
 
-    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
-        self.output_specs.clone()
+    fn data_types(&self) -> Vec<DataType> {
+        self.output_types.clone()
     }
 }

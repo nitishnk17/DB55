@@ -4,7 +4,6 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 use common::query::SortSpec;
 use common::DataType;
-use db_config::table::ColumnSpec;
 use crate::buffer_pool::BufferPool;
 use crate::disk_run::{rows_to_blocks, Run, RunReader};
 use crate::operator::Operator;
@@ -21,7 +20,7 @@ pub struct SortOp<R: Read, W: Write> {
     /// External sort path: final merged run on disk, read via RunReader.
     final_run_reader: Option<RunReader>,
     output_schema: Vec<String>,
-    output_specs: Vec<ColumnSpec>,
+    output_types: Vec<DataType>,
     _marker: std::marker::PhantomData<(R, W)>,
 }
 
@@ -50,8 +49,8 @@ impl<R: Read, W: Write> Operator<R, W> for SortOp<R, W> {
         self.output_schema.clone()
     }
 
-    fn column_specs(&self) -> Vec<ColumnSpec> {
-        self.output_specs.clone()
+    fn data_types(&self) -> Vec<DataType> {
+        self.output_types.clone()
     }
 }
 
@@ -64,8 +63,8 @@ impl<R: Read, W: Write> SortOp<R, W> {
     /// operators.
     pub fn new(
         mut child: Box<dyn Operator<R, W>>,
-        sort_specs: Vec<SortSpec>,
-        column_specs: Vec<ColumnSpec>,
+        sort_specs: &[SortSpec],
+        data_types: Vec<DataType>,
         buffer_pool: &mut BufferPool<R, W>,
         sort_memory_bytes: usize,
     ) -> Self {
@@ -87,7 +86,7 @@ impl<R: Read, W: Write> SortOp<R, W> {
             .collect();
 
         // Calculate how many rows fit in the memory budget
-        let memory_budget_rows = estimate_memory_budget(sort_memory_bytes, &column_specs);
+        let memory_budget_rows = estimate_memory_budget(sort_memory_bytes, &data_types);
         let block_size = buffer_pool.block_size();
 
         eprintln!(
@@ -116,7 +115,7 @@ impl<R: Read, W: Write> SortOp<R, W> {
                 current_index: 0,
                 final_run_reader: None,
                 output_schema,
-                output_specs: column_specs,
+                output_types: data_types,
                 _marker: std::marker::PhantomData,
             };
         }
@@ -170,20 +169,20 @@ impl<R: Read, W: Write> SortOp<R, W> {
         let final_run = merge_all_runs_to_disk(
             runs,
             &sort_keys,
-            &column_specs,
+            &data_types,
             buffer_pool,
             block_size,
         );
 
         eprintln!("Sort: merge complete, {} rows in final run on disk", final_run.num_rows);
 
-        let reader = RunReader::new(&final_run, column_specs.clone(), buffer_pool);
+        let reader = RunReader::new(&final_run, data_types.clone(), buffer_pool);
         SortOp {
             sorted_rows: Vec::new(),
             current_index: 0,
             final_run_reader: Some(reader),
             output_schema,
-            output_specs: column_specs,
+            output_types: data_types,
             _marker: std::marker::PhantomData,
         }
     }
@@ -214,11 +213,11 @@ fn compare_rows(a: &Row, b: &Row, sort_keys: &[(usize, bool)]) -> Ordering {
 /// than the on-disk binary encoding.  The per-row overhead is larger in memory
 /// because each Data::String owns a heap-allocated String, and the Vec itself
 /// adds indirection.
-fn estimate_memory_budget(sort_memory_bytes: usize, column_specs: &[ColumnSpec]) -> usize {
+fn estimate_memory_budget(sort_memory_bytes: usize, data_types: &[DataType]) -> usize {
     // Estimated bytes for each column's Data variant on the heap
-    let data_size: usize = column_specs
+    let data_size: usize = data_types
         .iter()
-        .map(|c| match c.data_type {
+        .map(|dt| match dt {
             DataType::Int32   => 4,
             DataType::Int64   => 8,
             DataType::Float32 => 4,
@@ -230,7 +229,7 @@ fn estimate_memory_budget(sort_memory_bytes: usize, column_specs: &[ColumnSpec])
 
     // Vec<Data> overhead: 24 bytes for Vec struct itself
     // Each Data enum variant: 32 bytes (enum discriminant + largest variant)
-    let row_overhead = 24 + column_specs.len() * 32;
+    let row_overhead = 24 + data_types.len() * 32;
     let effective_row_size = data_size + row_overhead;
 
     // Use the supplied memory budget (at least 100 rows to avoid degenerate behaviour)
@@ -279,7 +278,7 @@ impl Ord for HeapEntry {
 fn merge_all_runs_to_disk(
     mut runs: Vec<Run>,
     sort_keys: &[(usize, bool)],
-    column_specs: &[ColumnSpec],
+    data_types: &[DataType],
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
     block_size: usize,
 ) -> Run {
@@ -302,7 +301,7 @@ fn merge_all_runs_to_disk(
                 let merged_run = merge_k_runs_to_disk(
                     chunk,
                     sort_keys,
-                    column_specs,
+                    data_types,
                     buffer_pool,
                     block_size,
                 );
@@ -318,13 +317,13 @@ fn merge_all_runs_to_disk(
 fn merge_k_runs_to_disk(
     runs: &[Run],
     sort_keys: &[(usize, bool)],
-    column_specs: &[ColumnSpec],
+    data_types: &[DataType],
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
     block_size: usize,
 ) -> Run {
     let mut readers: Vec<RunReader> = runs
         .iter()
-        .map(|run| RunReader::new(run, column_specs.to_vec(), buffer_pool))
+        .map(|run| RunReader::new(run, data_types.to_vec(), buffer_pool))
         .collect();
 
     // Wrap sort_keys in Arc so all HeapEntries share one allocation.

@@ -1,5 +1,5 @@
 use std::io::{Read, Write};
-use db_config::table::ColumnSpec;
+use common::DataType;
 use crate::buffer_pool::BufferPool;
 use crate::disk_run::{rows_to_blocks, Run, RunReader};
 use crate::operator::Operator;
@@ -9,7 +9,7 @@ pub struct JoinOp<R: Read, W: Write> {
     joined_rows: Vec<Row>,
     current_index: usize,
     output_schema: Vec<String>,
-    output_specs: Vec<db_config::table::ColumnSpec>,
+    output_types: Vec<DataType>,
     _marker: std::marker::PhantomData<(R, W)>,
 }
 
@@ -19,15 +19,15 @@ impl<R: Read, W: Write> JoinOp<R, W> {
         mut right: Box<dyn Operator<R, W>>,
         left_col_idx: usize,
         right_col_idx: usize,
-        right_column_specs: Vec<ColumnSpec>,
+        right_types: Vec<DataType>,
         buffer_pool: &mut BufferPool<R, W>,
     ) -> Self {
         // Output schema
         let mut output_schema = left.schema();
         output_schema.extend(right.schema());
 
-        let mut output_specs = left.column_specs();
-        output_specs.extend(right.column_specs());
+        let mut output_types = left.data_types();
+        output_types.extend(right.data_types());
 
         // 1. Materialize the right child entirely into anonymous blocks
         let mut right_rows = Vec::new();
@@ -50,10 +50,7 @@ impl<R: Read, W: Write> JoinOp<R, W> {
         };
 
         // 2. Perform Block Nested Loop Join (BNLJ)
-        // Memory budget: B-2 pages for outer (left), 1 page for inner (right_run), 1 for output (which we append to joined_rows)
-        // B is total frames in buffer pool. Let's conservatively assume we have e.g., 200 block slots, 
-        // using ~100 blocks size for chunk is more than safe since B defaults to some large size like 16384 in this DB.
-        let outer_memory_budget_blocks = 100; // Arbitrary safe "B-2" equivalent chunk size
+        let outer_memory_budget_blocks = 100;
         let max_chunk_rows = std::cmp::max((outer_memory_budget_blocks * block_size) / 256, 100);
 
         let mut joined_rows = Vec::new();
@@ -74,7 +71,7 @@ impl<R: Read, W: Write> JoinOp<R, W> {
             }
 
             // Stream inner (right_run) and check against all rows in left_chunk
-            let mut right_reader = RunReader::new(&right_run, right_column_specs.clone(), buffer_pool);
+            let mut right_reader = RunReader::new(&right_run, right_types.clone(), buffer_pool);
 
             loop {
                 if let Some(right_row) = right_reader.peek() {
@@ -102,7 +99,7 @@ impl<R: Read, W: Write> JoinOp<R, W> {
             joined_rows,
             current_index: 0,
             output_schema,
-            output_specs,
+            output_types,
             _marker: std::marker::PhantomData,
         }
     }
@@ -123,7 +120,7 @@ impl<R: Read, W: Write> Operator<R, W> for JoinOp<R, W> {
         self.output_schema.clone()
     }
 
-    fn column_specs(&self) -> Vec<db_config::table::ColumnSpec> {
-        self.output_specs.clone()
+    fn data_types(&self) -> Vec<DataType> {
+        self.output_types.clone()
     }
 }

@@ -2,8 +2,7 @@ use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 
-use common::Data;
-use db_config::table::ColumnSpec;
+use common::{Data, DataType};
 
 use crate::buffer_pool::BufferPool;
 use crate::disk_run::{rows_to_blocks, Run, RunReader};
@@ -29,8 +28,8 @@ pub struct HashJoinOp<R: Read, W: Write> {
     current_index: usize,
     /// Output schema = left_schema ++ right_schema.
     output_schema: Vec<String>,
-    /// Full column specs for output columns.
-    output_specs: Vec<ColumnSpec>,
+    /// Data types for output columns.
+    output_types: Vec<DataType>,
     _marker: std::marker::PhantomData<(R, W)>,
 }
 
@@ -61,7 +60,6 @@ fn partition_input<R: Read, W: Write>(
     input: &mut Box<dyn Operator<R, W>>,
     join_col_idx: usize,
     num_partitions: usize,
-    _column_specs: &[ColumnSpec],
     buffer_pool: &mut BufferPool<R, W>,
 ) -> Vec<Option<Run>> {
     // Accumulate rows per bucket in memory, then flush to disk.
@@ -106,20 +104,15 @@ fn build_and_probe(
     probe_run: &Run,
     build_col_idx: usize,
     probe_col_idx: usize,
-    build_specs: &[ColumnSpec],
-    probe_specs: &[ColumnSpec],
+    build_types: &[DataType],
+    probe_types: &[DataType],
     build_is_left: bool,
     buffer_pool: &mut BufferPool<impl Read, impl Write>,
 ) -> Vec<Row> {
     // BUILD: load entire build partition into an in-memory hash map.
-    // Key = hash(join_val), Value = Vec<Row> (to handle collisions).
-    //
-    // Pre-size the map with the known row count so the HashMap never needs to
-    // rehash during the build phase.  `with_capacity(n)` guarantees at least n
-    // buckets, eliminating O(log n) rehash copies for large partitions.
     let mut hash_table: HashMap<u64, Vec<Row>> = HashMap::with_capacity(build_run.num_rows);
 
-    let mut build_reader = RunReader::new(build_run, build_specs.to_vec(), buffer_pool);
+    let mut build_reader = RunReader::new(build_run, build_types.to_vec(), buffer_pool);
     loop {
         if let Some(row) = build_reader.peek() {
             let h = hash_data(&row.values[build_col_idx]);
@@ -131,11 +124,9 @@ fn build_and_probe(
     }
 
     // PROBE: scan probe partition, look up matches in hash table.
-    // Pre-allocate to avoid repeated reallocations; min(build, probe) is a
-    // safe lower bound for an equi-join result size.
     let mut results = Vec::with_capacity(build_run.num_rows.min(probe_run.num_rows));
 
-    let mut probe_reader = RunReader::new(probe_run, probe_specs.to_vec(), buffer_pool);
+    let mut probe_reader = RunReader::new(probe_run, probe_types.to_vec(), buffer_pool);
     loop {
         if let Some(probe_row) = probe_reader.peek() {
             let h = hash_data(&probe_row.values[probe_col_idx]);
@@ -174,20 +165,18 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
         mut right: Box<dyn Operator<R, W>>,
         left_col_idx: usize,
         right_col_idx: usize,
-        left_column_specs: Vec<ColumnSpec>,
-        right_column_specs: Vec<ColumnSpec>,
+        left_types: Vec<DataType>,
+        right_types: Vec<DataType>,
         buffer_pool: &mut BufferPool<R, W>,
     ) -> Self {
         // Output schema = left columns followed by right columns
         let mut output_schema = left.schema();
         output_schema.extend(right.schema());
 
-        let mut output_specs = left.column_specs();
-        output_specs.extend(right.column_specs());
+        let mut output_types = left.data_types();
+        output_types.extend(right.data_types());
 
         // Number of partitions — 64 is a reasonable default.
-        // For very large tables this keeps each partition small enough
-        // to fit an in-memory hash table within the 64 MB budget.
         let num_partitions = 64;
 
         eprintln!(
@@ -200,14 +189,12 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
             &mut left,
             left_col_idx,
             num_partitions,
-            &left_column_specs,
             buffer_pool,
         );
         let partitions_right = partition_input(
             &mut right,
             right_col_idx,
             num_partitions,
-            &right_column_specs,
             buffer_pool,
         );
 
@@ -222,11 +209,11 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
             };
 
             // Choose the smaller partition as the build side
-            let (build_is_left, build_run, probe_run, build_specs, probe_specs, build_idx, probe_idx) =
+            let (build_is_left, build_run, probe_run, build_types_ref, probe_types_ref, build_idx, probe_idx) =
                 if left_part.num_rows <= right_part.num_rows {
-                    (true, left_part, right_part, &left_column_specs, &right_column_specs, left_col_idx, right_col_idx)
+                    (true, left_part, right_part, left_types.as_slice(), right_types.as_slice(), left_col_idx, right_col_idx)
                 } else {
-                    (false, right_part, left_part, &right_column_specs, &left_column_specs, right_col_idx, left_col_idx)
+                    (false, right_part, left_part, right_types.as_slice(), left_types.as_slice(), right_col_idx, left_col_idx)
                 };
 
             let partition_results = build_and_probe(
@@ -234,8 +221,8 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
                 probe_run,
                 build_idx,
                 probe_idx,
-                build_specs,
-                probe_specs,
+                build_types_ref,
+                probe_types_ref,
                 build_is_left,
                 buffer_pool,
             );
@@ -249,7 +236,7 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
             joined_rows,
             current_index: 0,
             output_schema,
-            output_specs,
+            output_types,
             _marker: std::marker::PhantomData,
         }
     }
@@ -272,7 +259,7 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
         self.output_schema.clone()
     }
 
-    fn column_specs(&self) -> Vec<ColumnSpec> {
-        self.output_specs.clone()
+    fn data_types(&self) -> Vec<DataType> {
+        self.output_types.clone()
     }
 }
