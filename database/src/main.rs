@@ -26,23 +26,10 @@ mod sort;
 mod table_scanner;
 
 fn db_main() -> Result<()> {
-    // Removed stderr DEV_NULL interceptor
-
     let cli_options = CliOptions::parse();
 
     // Load database schema / statistics context
     let ctx = DbContext::load_from_file(cli_options.get_config_path())?;
-    for table_spec in ctx.get_table_specs() {
-        eprintln!("Table: {}", table_spec.name);
-        eprintln!("File id: {}", table_spec.file_id);
-        for column_spec in &table_spec.column_specs {
-            eprintln!(
-                "\tColumn: {} ({:?})",
-                column_spec.column_name, column_spec.data_type
-            );
-        }
-        eprintln!();
-    }
 
     // Setup I/O handlers for disk and monitor
     let (disk_in, disk_out) = setup_disk_io();
@@ -51,7 +38,6 @@ fn db_main() -> Result<()> {
     // Initialize DiskManager (queries block size automatically)
     let disk_manager = disk_manager::DiskManager::new(disk_in, disk_out)?;
     let block_size = disk_manager.block_size as usize;
-    eprintln!("Block size: {} bytes", block_size);
 
     // Use buffered reader for monitor input
     let mut monitor_buf_reader = BufReader::new(monitor_in);
@@ -61,7 +47,6 @@ fn db_main() -> Result<()> {
     monitor_buf_reader.read_line(&mut input_line)?;
     let query: Query = serde_json::from_str(input_line.trim())
         .with_context(|| format!("Failed to parse query JSON: {}", input_line))?;
-    eprintln!("Query received: {:#?}", query);
 
     // ── Step 2: Request memory limit from monitor ─────────────────────────
     input_line.clear();
@@ -71,37 +56,25 @@ fn db_main() -> Result<()> {
     let memory_limit_mb: usize = input_line.trim().parse()
         .with_context(|| format!("Failed to parse memory limit: {}", input_line))?;
     let memory_limit_bytes = memory_limit_mb * 1024 * 1024;
-    eprintln!("Memory limit: {} MB ({} bytes)", memory_limit_mb, memory_limit_bytes);
-
-    // ── Step 3: Size the buffer pool ─────────────────────────────────────
+    // ── Step 3: Size the buffer pool conservatively ─────────────────────
     //
-    // RLIMIT_AS on Linux limits total virtual address space to memory_limit_bytes.
-    // A Rust binary + glibc + libstd + stack already occupies ~25–35 MB of virtual
-    // address space before we allocate any heap.  We must therefore NOT use all of
-    // memory_limit_bytes for the buffer pool.
+    // The assignment harness runs the database under a strict RLIMIT_AS budget on
+    // Linux.  Using "most" of that budget for our own heap leaves too little room
+    // for the Rust runtime, shared libraries, stacks, and temporary operator state.
     //
-    // Strategy: use at most 25 % of the limit for buffer frames, but clamp to a
-    // sensible range so we always have at least 256 frames and never more than
-    // 8 192 frames (32 MB at 4 KB/frame).
-    //
-    // The remaining ~75 % is available for:
-    //   • sort / join working vectors  (we budget 50 % of the limit)
-    //   • code + shared libraries + stack  (OS-level virtual overhead ~20-30 MB)
-    let pool_bytes  = (memory_limit_bytes / 4).max(1 * 1024 * 1024); // at least 1 MB
-    let num_frames  = (pool_bytes / block_size).clamp(256, 8192);
+    // We therefore keep the buffer pool and sort working set intentionally modest:
+    //   • ~10% of the limit for buffer frames
+    //   • ~30% of the limit for sort run generation
+    //   • the remaining ~60% left untouched as headroom for the process itself and
+    //     other transient allocations during joins / sorting.
+    let min_frames = 64usize;
+    let max_frames = 2048usize;
+    let target_pool_bytes = (memory_limit_bytes / 10).max(block_size * min_frames);
+    let num_frames = (target_pool_bytes / block_size).clamp(min_frames, max_frames);
 
-    // Sort operators get 50 % of total limit as their in-memory row budget.
-    // This translates to a byte budget that estimate_memory_budget() converts to
-    // a maximum row count.
-    let sort_memory_bytes: usize = memory_limit_bytes / 2;
-
-    eprintln!(
-        "Buffer pool: {} frames × {} bytes = {} MB",
-        num_frames,
-        block_size,
-        (num_frames * block_size) / (1024 * 1024)
-    );
-    eprintln!("Sort memory budget: {} MB", sort_memory_bytes / (1024 * 1024));
+    // Keep sort buffers conservative as well so external sort kicks in earlier
+    // instead of risking RLIMIT_AS failures on large queries.
+    let sort_memory_bytes = (memory_limit_bytes * 3 / 10).max(block_size * min_frames);
 
     let mut buffer_pool = buffer_pool::BufferPool::new(num_frames, disk_manager);
 

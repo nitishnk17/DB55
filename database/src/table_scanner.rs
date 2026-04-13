@@ -9,7 +9,6 @@ use std::collections::VecDeque;
 pub struct TableScanner {
     column_names: Vec<String>,
     column_types: Vec<DataType>,
-    file_id: String,
     start_block: u64,
     num_blocks: u64,
     current_block: u64,
@@ -37,7 +36,6 @@ impl TableScanner {
         TableScanner {
             column_names,
             column_types,
-            file_id: file_id.to_string(),
             start_block,
             num_blocks,
             current_block: start_block,

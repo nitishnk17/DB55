@@ -58,10 +58,6 @@ impl<R: Read, W: Write> BufferPool<R, W> {
         self.policy = policy;
     }
 
-    pub fn get_eviction_policy(&self) -> EvictionPolicy {
-        self.policy
-    }
-
     pub fn num_frames(&self) -> usize {
         self.frames.len()
     }
