@@ -31,8 +31,12 @@ pub fn decode_row(bytes: &[u8], types: &[DataType]) -> (Row, usize){
                 offset += 8;
             }
             DataType::String => {
-                let end = bytes[offset..].iter().position(|&b| b == 0).unwrap();
-                let val = String::from_utf8(bytes[offset..offset+end].to_vec()).unwrap();
+                // Find the null terminator; if absent (malformed block), consume the rest.
+                let end = bytes[offset..].iter().position(|&b| b == 0)
+                    .unwrap_or(bytes.len() - offset);
+                // Use lossy conversion: invalid UTF-8 sequences become U+FFFD so
+                // we never panic on unexpected byte patterns.
+                let val = String::from_utf8_lossy(&bytes[offset..offset+end]).into_owned();
                 values.push(Data::String(val));
                 offset += end + 1;
             }

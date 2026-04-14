@@ -121,8 +121,12 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                 // Build the starting leaf with its pushed-down scalar predicates
                 let start_leaf_op = build_leaf_with_filter(
                     leaves[start_idx], &scalar_preds[start_idx], &global_needed, ctx, buffer_pool, sort_memory_bytes);
-                let mut current_op = start_leaf_op;
-                let mut current_schema = leaf_schemas[start_idx].clone();
+                // Use the ACTUAL operator schema (post-projection) rather than the
+                // logical leaf schema.  build_leaf_with_filter may have dropped columns
+                // not in global_needed, so current_schema must reflect that or the
+                // intermediate project pushdown would reference non-existent columns.
+                let mut current_schema = start_leaf_op.schema();
+                let mut current_op: Box<dyn Operator<R, W>> = start_leaf_op;
 
                 while joined.iter().any(|&m| !m) {
                     // Find next leaf connected to current result by an EQ join pred

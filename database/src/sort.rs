@@ -213,24 +213,34 @@ fn compare_rows(a: &Row, b: &Row, sort_keys: &[(usize, bool)]) -> Ordering {
 /// because each Data::String owns a heap-allocated String, and the Vec itself
 /// adds indirection.
 fn estimate_memory_budget(sort_memory_bytes: usize, data_types: &[DataType]) -> usize {
-    // Estimated bytes for each column's Data variant on the heap
-    let data_size: usize = data_types
+    // In-memory cost of one Data enum value:
+    //   - The enum discriminant + padding: 8 bytes
+    //   - The payload: size of the actual value
+    //       Int32/Float32: 4 bytes (padded to 8 in the enum)
+    //       Int64/Float64: 8 bytes
+    //       String: 24-byte String header + heap-allocated payload
+    //
+    // We do NOT separately add a "per-type data size" because the enum
+    // body already includes the payload bytes.  The previous version
+    // added both data_size (payload) and 32 bytes/col (enum), causing
+    // double-counting and an overly conservative estimate that spilled
+    // to disk sooner than necessary.
+    let per_col_bytes: usize = data_types
         .iter()
         .map(|dt| match dt {
-            DataType::Int32   => 4,
-            DataType::Int64   => 8,
-            DataType::Float32 => 4,
-            DataType::Float64 => 8,
-            // String: 24-byte String header + ~80 bytes average payload (conservative
-            // for TPC-H VARCHAR columns which can reach 79+ chars in o_comment, l_comment)
-            DataType::String  => 104,
+            DataType::Int32   => 8,   // enum (8 disc/pad) + 4 val, rounded to 8
+            DataType::Int64   => 16,  // enum (8) + 8 val
+            DataType::Float32 => 8,
+            DataType::Float64 => 16,
+            // String enum: 8 (disc) + 24 (String struct) + heap payload.
+            // TPC-H VARCHAR columns: o_comment/l_comment up to 79 chars → 80 bytes.
+            DataType::String  => 8 + 24 + 80,
         })
         .sum();
 
-    // Vec<Data> overhead: 24 bytes for Vec struct itself
-    // Each Data enum variant: 32 bytes (enum discriminant + largest variant)
-    let row_overhead = 24 + data_types.len() * 32;
-    let effective_row_size = data_size + row_overhead;
+    // Row wrapper: Vec<Data> has a 24-byte header (ptr + len + cap).
+    let row_overhead = 24usize;
+    let effective_row_size = (row_overhead + per_col_bytes).max(32);
 
     // Use the supplied memory budget (at least 100 rows to avoid degenerate behaviour)
     let budget = sort_memory_bytes.max(1024 * 1024); // floor at 1 MB
