@@ -139,14 +139,13 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
         left_types: Vec<DataType>,
         right_types: Vec<DataType>,
         buffer_pool: &mut BufferPool<R, W>,
+        num_partitions: usize,
     ) -> Self {
         let mut output_schema = left.schema();
         output_schema.extend(right.schema());
 
         let mut output_types = left.data_types();
         output_types.extend(right.data_types());
-
-        let num_partitions = 64;
 
         let left_row_bytes  = estimate_row_bytes(&left_types);
         let right_row_bytes = estimate_row_bytes(&right_types);

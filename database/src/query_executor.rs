@@ -165,7 +165,10 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                                     current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
                                         eprintln!("Join strategy: Grace Hash Join (Setting LRU cache)");
                                         buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::LRU);
-                                        Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, ldt, rdt, buffer_pool))
+                                        let num_parts = adaptive_hash_partitions(
+                                            &current_schema, &right_schema, &ldt, &rdt,
+                                            sort_memory_bytes, ctx);
+                                        Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, ldt, rdt, buffer_pool, num_parts))
                                     } else {
                                         eprintln!("Join strategy: Block Nested Loop Join (Setting MRU cache)");
                                         buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::MRU);
@@ -320,6 +323,59 @@ fn clone_cmp_value(v: &ComparisionValue) -> ComparisionValue {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/// Compute the number of hash join partitions adaptively.
+///
+/// The formula ensures each partition's build side fits within the available
+/// memory budget.  The cardinality stats come from the database config and
+/// automatically reflect the actual scale factor of the dataset, so the
+/// partition count scales up for larger databases without hard-coding a
+/// scale factor.
+///
+/// Clamped to [64, 2048] — the lower bound prevents excessive I/O for small
+/// tables; the upper bound limits the number of scratch blocks allocated.
+fn adaptive_hash_partitions(
+    left_schema: &[String],
+    right_schema: &[String],
+    left_types: &[DataType],
+    right_types: &[DataType],
+    sort_memory_bytes: usize,
+    ctx: &DbContext,
+) -> usize {
+    // Estimate bytes per row for the larger side (that becomes the build side)
+    let left_row_bytes  = row_bytes_for_types(left_types);
+    let right_row_bytes = row_bytes_for_types(right_types);
+    let max_row_bytes   = left_row_bytes.max(right_row_bytes).max(32);
+
+    // Target: each partition's in-memory hash table uses at most half of the
+    // sort memory budget (sort is not running concurrently with join build).
+    let target_build_mem = (sort_memory_bytes / 2).max(8 * 1024 * 1024);
+    let rows_per_part = (target_build_mem / max_row_bytes).max(1_000);
+
+    // Use the larger of the two estimated cardinalities.
+    // For intermediate join results the stats return a base-table column
+    // cardinality, which is a reasonable upper-bound proxy.
+    let left_card  = estimate_cardinality(left_schema,  ctx).unwrap_or(1_000_000) as usize;
+    let right_card = estimate_cardinality(right_schema, ctx).unwrap_or(1_000_000) as usize;
+    let max_card   = left_card.max(right_card);
+
+    // Round up to next power-of-two for even hash distribution.
+    let raw = ((max_card + rows_per_part - 1) / rows_per_part).max(1);
+    let p = raw.next_power_of_two();
+    let result = p.clamp(64, 2048);
+    eprintln!("HashJoin adaptive partitions: max_card={}, rows_per_part={}, num_partitions={}",
+              max_card, rows_per_part, result);
+    result
+}
+
+/// Estimate in-memory bytes per row from column DataTypes.
+fn row_bytes_for_types(types: &[DataType]) -> usize {
+    types.iter().map(|dt| match dt {
+        DataType::Int32 | DataType::Float32 => 4usize,
+        DataType::Int64 | DataType::Float64 => 8usize,
+        DataType::String => 104usize,
+    }).sum::<usize>().max(32)
+}
 
 /// Decide between Grace Hash Join and BNLJ based on cardinality statistics.
 ///
