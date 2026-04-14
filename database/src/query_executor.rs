@@ -175,6 +175,35 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                                     joined[leaf_idx] = true;
                                     remaining_preds.remove(pred_idx);
                                     found = true;
+
+                                    // ── Intermediate project pushdown ────────────────
+                                    // After each join step, drop columns that are not
+                                    // needed for the final output or for any remaining
+                                    // join/filter predicates.  This keeps intermediate
+                                    // rows narrow, reducing I/O for the next join phase.
+                                    let future_cols: std::collections::HashSet<String> = remaining_preds
+                                        .iter()
+                                        .flat_map(|pred| {
+                                            let mut v = vec![pred.column_name.clone()];
+                                            if let ComparisionValue::Column(c) = &pred.value {
+                                                v.push(c.clone());
+                                            }
+                                            v
+                                        })
+                                        .collect();
+
+                                    let keep: Vec<(String, String)> = current_schema
+                                        .iter()
+                                        .filter(|c| global_needed.contains(*c) || future_cols.contains(*c))
+                                        .map(|c| (c.clone(), c.clone()))
+                                        .collect();
+
+                                    if keep.len() < current_schema.len() {
+                                        let new_schema: Vec<String> = keep.iter().map(|(_, to)| to.clone()).collect();
+                                        current_op = Box::new(ProjectOp::new(current_op, keep));
+                                        current_schema = new_schema;
+                                    }
+
                                     break 'search;
                                 }
                             }
@@ -190,6 +219,30 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                         current_op = Box::new(CrossOp::new(current_op, right_op, buffer_pool));
                         current_schema.extend(right_schema);
                         joined[leaf_idx] = true;
+
+                        // Intermediate project pushdown after cross product too
+                        let future_cols: std::collections::HashSet<String> = remaining_preds
+                            .iter()
+                            .flat_map(|pred| {
+                                let mut v = vec![pred.column_name.clone()];
+                                if let ComparisionValue::Column(c) = &pred.value {
+                                    v.push(c.clone());
+                                }
+                                v
+                            })
+                            .collect();
+
+                        let keep: Vec<(String, String)> = current_schema
+                            .iter()
+                            .filter(|c| global_needed.contains(*c) || future_cols.contains(*c))
+                            .map(|c| (c.clone(), c.clone()))
+                            .collect();
+
+                        if keep.len() < current_schema.len() {
+                            let new_schema: Vec<String> = keep.iter().map(|(_, to)| to.clone()).collect();
+                            current_op = Box::new(ProjectOp::new(current_op, keep));
+                            current_schema = new_schema;
+                        }
                     }
                 }
 

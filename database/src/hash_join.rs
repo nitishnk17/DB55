@@ -9,6 +9,17 @@ use crate::disk_run::{rows_to_blocks, Run, RunReader};
 use crate::operator::Operator;
 use crate::row::Row;
 
+/// Estimate in-memory bytes per row from its column types.
+fn estimate_row_bytes(types: &[DataType]) -> usize {
+    types.iter().map(|dt| match dt {
+        DataType::Int32   => 4,
+        DataType::Int64   => 8,
+        DataType::Float32 => 4,
+        DataType::Float64 => 8,
+        DataType::String  => 104, // 24-byte header + ~80 byte TPC-H VARCHAR payload
+    }).sum::<usize>().max(32)
+}
+
 // ─── Grace Hash Join ─────────────────────────────────────────────────────
 
 /// Grace Hash Join operator.
@@ -60,13 +71,16 @@ fn partition_input<R: Read, W: Write>(
     join_col_idx: usize,
     num_partitions: usize,
     buffer_pool: &mut BufferPool<R, W>,
+    row_size_bytes: usize,
 ) -> Vec<Option<Run>> {
     let mut buckets: Vec<Vec<Row>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let mut block_ids: Vec<Vec<u64>> = (0..num_partitions).map(|_| Vec::new()).collect();
     let mut total_rows: Vec<usize> = vec![0; num_partitions];
 
     let block_size = buffer_pool.block_size();
-    let rows_per_flush = std::cmp::max(block_size / 256, 100);
+    // Flush each bucket after this many rows so that peak memory per bucket
+    // is bounded by ~one block worth of data (avoids OOM for wide rows).
+    let rows_per_flush = std::cmp::max(block_size / row_size_bytes, 4).max(32);
 
     while let Some(row) = input.next(buffer_pool) {
         let h = hash_data(&row.values[join_col_idx]);
@@ -134,13 +148,16 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
 
         let num_partitions = 64;
 
+        let left_row_bytes  = estimate_row_bytes(&left_types);
+        let right_row_bytes = estimate_row_bytes(&right_types);
+
         eprintln!(
-            "HashJoin: partitioning into {} buckets (left_col={}, right_col={})",
-            num_partitions, left_col_idx, right_col_idx
+            "HashJoin: partitioning into {} buckets (left_col={}, right_col={}, ~{}/{}B per row)",
+            num_partitions, left_col_idx, right_col_idx, left_row_bytes, right_row_bytes
         );
 
-        let partitions_left = partition_input(&mut left, left_col_idx, num_partitions, buffer_pool);
-        let partitions_right = partition_input(&mut right, right_col_idx, num_partitions, buffer_pool);
+        let partitions_left  = partition_input(&mut left,  left_col_idx,  num_partitions, buffer_pool, left_row_bytes);
+        let partitions_right = partition_input(&mut right, right_col_idx, num_partitions, buffer_pool, right_row_bytes);
 
         HashJoinOp {
             partitions_left,
