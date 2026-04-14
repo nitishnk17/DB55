@@ -345,6 +345,7 @@ fn build_leaf_with_filter<R: Read + 'static, W: Write + 'static>(
     }
 
     let current_schema = op.schema();
+    let total_cols = current_schema.len(); // save before consuming via into_iter()
 
     // Project pushdown: Keep only columns requested globally that are present in the current schema
     let needed_here: Vec<(String, String)> = current_schema
@@ -354,7 +355,7 @@ fn build_leaf_with_filter<R: Read + 'static, W: Write + 'static>(
         .collect();
 
     // Only wrap with ProjectOp if it actually restricts columns
-    if !needed_here.is_empty() && needed_here.len() < op.schema().len() {
+    if !needed_here.is_empty() && needed_here.len() < total_cols {
         op = Box::new(ProjectOp::new(op, needed_here));
     }
 

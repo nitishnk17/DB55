@@ -221,8 +221,9 @@ fn estimate_memory_budget(sort_memory_bytes: usize, data_types: &[DataType]) -> 
             DataType::Int64   => 8,
             DataType::Float32 => 4,
             DataType::Float64 => 8,
-            // String: 24-byte String header + ~50 bytes average payload
-            DataType::String  => 74,
+            // String: 24-byte String header + ~80 bytes average payload (conservative
+            // for TPC-H VARCHAR columns which can reach 79+ chars in o_comment, l_comment)
+            DataType::String  => 104,
         })
         .sum();
 

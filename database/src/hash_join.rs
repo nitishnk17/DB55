@@ -192,22 +192,23 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
             // 2. Scan probe partition for next matching row
             if let Some(reader) = &mut self.probe_reader {
                 if let Some(probe_row) = reader.peek() {
-                    let probe_row_clone = probe_row.clone();
-                    self.current_probe_row = Some(probe_row_clone.clone());
+                    // Clone once — this owned copy is used for both the lookup and the output row.
+                    let probe_row_owned = probe_row.clone();
                     self.current_matches.clear();
                     self.current_match_idx = 0;
 
                     let probe_idx = if self.build_is_left { self.right_col_idx } else { self.left_col_idx };
                     let build_idx = if self.build_is_left { self.left_col_idx } else { self.right_col_idx };
 
-                    let h = hash_data(&probe_row_clone.values[probe_idx]);
+                    let h = hash_data(&probe_row_owned.values[probe_idx]);
                     if let Some(candidates) = self.hash_table.get(&h) {
                         for build_row in candidates {
-                            if build_row.values[build_idx] == probe_row_clone.values[probe_idx] {
+                            if build_row.values[build_idx] == probe_row_owned.values[probe_idx] {
                                 self.current_matches.push(build_row.clone());
                             }
                         }
                     }
+                    self.current_probe_row = Some(probe_row_owned);
                     reader.advance(pool);
                     continue; // Loop back around to yield matches
                 } else {
