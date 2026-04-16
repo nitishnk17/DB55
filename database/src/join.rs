@@ -5,6 +5,19 @@ use crate::disk_run::{rows_to_blocks, Run, RunReader};
 use crate::operator::Operator;
 use crate::row::Row;
 
+/// Estimate the in-memory byte size of a single row from its column types.
+/// Used to compute memory-safe chunk sizes instead of a hardcoded 256 bytes/row.
+fn estimate_row_bytes(types: &[DataType]) -> usize {
+    types.iter().map(|dt| match dt {
+        DataType::Int32   => 4,
+        DataType::Int64   => 8,
+        DataType::Float32 => 4,
+        DataType::Float64 => 8,
+        // String: 24-byte Vec header + conservative 80-byte payload (TPC-H VARCHARs)
+        DataType::String  => 104,
+    }).sum::<usize>().max(32) // floor at 32 bytes to avoid divide-by-zero / degenerate
+}
+
 pub struct JoinOp<R: Read, W: Write> {
     left: Box<dyn Operator<R, W>>,
     right_run: Run,
@@ -36,7 +49,11 @@ impl<R: Read, W: Write> JoinOp<R, W> {
 
         // 1. Materialize right child sequentially into a Run by flushing in chunks to stay well within 64MB memory limit
         let block_size = buffer_pool.block_size();
-        let chunk_size = std::cmp::max((100 * block_size) / 256, 100);
+        // Estimate row widths from actual types (not a hardcoded 256 bytes/row) so
+        // that wide join results (many columns, large VARCHARs) don't overflow memory.
+        let right_row_bytes = estimate_row_bytes(&right_types);
+        let left_row_bytes  = estimate_row_bytes(&left.data_types());
+        let chunk_size = std::cmp::max((100 * block_size) / right_row_bytes, 100);
         let mut block_ids = Vec::new();
         let mut total_right_rows = 0;
 
@@ -69,7 +86,7 @@ impl<R: Read, W: Write> JoinOp<R, W> {
         };
 
         let outer_memory_budget_blocks = 100;
-        let max_chunk_rows = std::cmp::max((outer_memory_budget_blocks * block_size) / 256, 100);
+        let max_chunk_rows = std::cmp::max((outer_memory_budget_blocks * block_size) / left_row_bytes, 100);
 
         JoinOp {
             left,

@@ -27,7 +27,13 @@ impl<R: Read, W: Write> CrossOp<R, W> {
 
         // Materialize right child sequentially into a Run (out-of-core)
         let block_size = pool.block_size();
-        let chunk_size = std::cmp::max((100 * block_size) / 256, 100);
+        // Estimate bytes per row from actual types to avoid OOM for wide rows.
+        let right_row_bytes: usize = right_types.iter().map(|dt| match dt {
+            common::DataType::Int32 | common::DataType::Float32 => 4usize,
+            common::DataType::Int64 | common::DataType::Float64 => 8usize,
+            common::DataType::String => 104usize,
+        }).sum::<usize>().max(32);
+        let chunk_size = std::cmp::max((100 * block_size) / right_row_bytes, 100);
         let mut block_ids = Vec::new();
         let mut total_right_rows = 0;
 

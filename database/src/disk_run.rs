@@ -76,14 +76,14 @@ impl RunReader {
         types: Vec<DataType>,
         buffer_pool: &mut BufferPool<impl Read, impl Write>,
     ) -> Self {
-        let block_data = if run.block_ids.is_empty() {
+        // Use sequential (cache-bypassing) read: run blocks are accessed once in order
+        // and will not be revisited, so caching them would only pollute the LRU pool.
+        let rows = if run.block_ids.is_empty() {
             vec![]
         } else {
-            let b = buffer_pool.fetch_block(run.block_ids[0]);
-            buffer_pool.unpin(run.block_ids[0]);
-            b
+            let block_data = buffer_pool.read_blocks_sequential(run.block_ids[0], 1);
+            decode_block(&block_data, &types)
         };
-        let rows = if run.block_ids.is_empty() { vec![] } else { decode_block(&block_data, &types) };
 
         RunReader {
             run: run.clone(),
@@ -111,8 +111,8 @@ impl RunReader {
                 return;
             }
             let block_id = self.run.block_ids[self.current_block_idx];
-            let block_data = buffer_pool.fetch_block(block_id);
-            buffer_pool.unpin(block_id);
+            // Sequential bypass: these blocks will not be re-read after this pass.
+            let block_data = buffer_pool.read_blocks_sequential(block_id, 1);
             self.current_block_rows = decode_block(&block_data, &self.types);
             self.current_row_idx = 0;
         }
