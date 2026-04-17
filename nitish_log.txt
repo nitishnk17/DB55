@@ -1,0 +1,230 @@
+    Finished `release` profile [optimized] target(s) in 0.03s
+     Running `target/release/monitor --config ./scratch/runtimes/tpch/monitor_config.json`
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 1,
+    total_writes: 0,
+    total_blocks_processed: 1,
+    total_cylinders_traveled: 2386,
+    total_io_time_us: 6182,
+    total_seek_time_us: 1988,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 27,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT n_nationkey, n_name, n_regionkey, '' FROM nation;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 1,
+    total_writes: 0,
+    total_blocks_processed: 1,
+    total_cylinders_traveled: 4179,
+    total_io_time_us: 6566,
+    total_seek_time_us: 2372,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 27,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT r_regionkey, r_name, '' FROM region;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 3,
+    total_writes: 0,
+    total_blocks_processed: 607,
+    total_cylinders_traveled: 1194,
+    total_io_time_us: 23182,
+    total_seek_time_us: 2440,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 16575,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT p_partkey, p_name, p_mfgr, p_brand, p_type, '' FROM part;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 1,
+    total_writes: 0,
+    total_blocks_processed: 36,
+    total_cylinders_traveled: 1790,
+    total_io_time_us: 6979,
+    total_seek_time_us: 1829,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 983,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT s_suppkey, s_name, s_acctbal, '' FROM supplier;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 3,
+    total_writes: 0,
+    total_blocks_processed: 618,
+    total_cylinders_traveled: 2982,
+    total_io_time_us: 23170,
+    total_seek_time_us: 2128,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 16876,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT c_custkey, c_name, c_mktsegment, '' FROM customer;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 1,
+    total_writes: 0,
+    total_blocks_processed: 1,
+    total_cylinders_traveled: 2386,
+    total_io_time_us: 6182,
+    total_seek_time_us: 1988,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 27,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT n_name, '' FROM nation WHERE n_regionkey = 1;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 1,
+    total_writes: 0,
+    total_blocks_processed: 1,
+    total_cylinders_traveled: 4179,
+    total_io_time_us: 6566,
+    total_seek_time_us: 2372,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 27,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT r_name, '' FROM region WHERE r_name != 'AFRICA';
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 3,
+    total_writes: 0,
+    total_blocks_processed: 607,
+    total_cylinders_traveled: 1194,
+    total_io_time_us: 23182,
+    total_seek_time_us: 2440,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 16575,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT p_name, p_size, '' FROM part WHERE p_size > 25;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 3,
+    total_writes: 0,
+    total_blocks_processed: 607,
+    total_cylinders_traveled: 1194,
+    total_io_time_us: 23182,
+    total_seek_time_us: 2440,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 16575,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT p_partkey, p_retailprice, '' FROM part WHERE p_retailprice >= 1000.00;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 1,
+    total_writes: 0,
+    total_blocks_processed: 36,
+    total_cylinders_traveled: 1790,
+    total_io_time_us: 6979,
+    total_seek_time_us: 1829,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 983,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT s_name, s_acctbal, '' FROM supplier WHERE s_acctbal < 0.0;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 3,
+    total_writes: 0,
+    total_blocks_processed: 618,
+    total_cylinders_traveled: 2982,
+    total_io_time_us: 23170,
+    total_seek_time_us: 2128,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 16876,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT c_name, c_mktsegment, '' FROM customer WHERE c_mktsegment = 'AUTOMOBILE';
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 17,
+    total_writes: 0,
+    total_blocks_processed: 4311,
+    total_cylinders_traveled: 1,
+    total_io_time_us: 122686,
+    total_seek_time_us: 800,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 117719,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT o_orderkey, o_totalprice, '' FROM orders WHERE o_orderstatus = 'O';
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 84,
+    total_writes: 0,
+    total_blocks_processed: 21325,
+    total_cylinders_traveled: 3583,
+    total_io_time_us: 592736,
+    total_seek_time_us: 6255,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 582315,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT l_orderkey, l_linenumber, '' FROM lineitem WHERE l_quantity <= 10;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 12,
+    total_writes: 0,
+    total_blocks_processed: 3040,
+    total_cylinders_traveled: 597,
+    total_io_time_us: 88573,
+    total_seek_time_us: 1394,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 83012,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT ps_partkey, ps_suppkey, '' FROM partsupp WHERE ps_availqty > 5000;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 84,
+    total_writes: 0,
+    total_blocks_processed: 21325,
+    total_cylinders_traveled: 3583,
+    total_io_time_us: 592736,
+    total_seek_time_us: 6255,
+    total_rotational_latency_us: 4167,
+    total_transfer_time_us: 582315,
+}
+--------------------------------------------------------------------------------
+
+Validation success! for SELECT l_orderkey, l_discount, '' FROM lineitem WHERE l_discount >= 0.05 AND l_discount <= 0.07;
+--------------------------------------------------------------------------------
+Disk IO metrics DiskIOMetricsResult {
+    total_reads: 0,
+    total_writes: 0,
+    total_blocks_processed: 0,
+    total_cylinders_traveled: 0,
+    total_io_time_us: 0,
+    total_seek_time_us: 0,
+    total_rotational_latency_us: 0,
+    total_transfer_time_us: 0,
+}
+--------------------------------------------------------------------------------
+
+Error: From Monitor
+
+Caused by:
+    0: Validation failed! for SELECT n_name, '' FROM nation ORDER BY n_name, n_nationkey;
+    1: Program did not validate the result
