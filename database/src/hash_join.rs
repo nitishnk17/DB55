@@ -11,10 +11,7 @@ use crate::row::Row;
 
 // ─── Grace Hash Join ─────────────────────────────────────────────────────
 
-/// Hybrid Hash Join operator.
-///
-/// Attempts an in-memory join first (up to 20MB limit). If the limit is 
-/// exceeded, gracefully falls back to Grace Hash Join by spilling to disk.
+/// Symmetric Hybrid Hash Join operator.
 pub struct HashJoinOp<R: Read, W: Write> {
     partitions_left: Vec<Option<Run>>,
     partitions_right: Vec<Option<Run>>,
@@ -33,7 +30,8 @@ pub struct HashJoinOp<R: Read, W: Write> {
     current_match_idx: usize,
 
     in_memory_mode: bool,
-    right_child: Option<Box<dyn Operator<R, W>>>,
+    probe_child: Option<Box<dyn Operator<R, W>>>,
+    probe_buffered: Vec<Row>,
 
     output_schema: Vec<String>,
     output_types: Vec<DataType>,
@@ -105,10 +103,6 @@ fn partition_input<R: Read, W: Write>(
     let mut total_rows: Vec<usize> = vec![0; num_partitions];
 
     let block_size = buffer_pool.block_size();
-    // Drop this to 500. 
-    // 500 rows * 64 buckets = 32,000 concurrent rows (~6 MB max).
-    // This perfectly fits within our 64 MB RLIMIT_AS budget while still 
-    // chunking enough to prevent severe disk fragmentation.
     let rows_per_flush = 500;
 
     let mut initial_iter = initial_rows.into_iter();
@@ -188,29 +182,67 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
         let mut output_types = left.data_types();
         output_types.extend(right.data_types());
 
-        // Hybrid Hash logic: Memory estimation phase
+        // Symmetric Hybrid Hash logic
         let mut left_buffered = Vec::new();
-        let mut left_size = 0;
+        let mut right_buffered = Vec::new();
+        let mut total_size = 0;
         let limit = 20 * 1024 * 1024; // 20 MB
         let left_row_size = estimate_row_size(&left_types);
-        let mut exceeded = false;
+        let right_row_size = estimate_row_size(&right_types);
 
-        while let Some(row) = left.next(buffer_pool) {
-            left_buffered.push(row);
-            left_size += left_row_size;
-            if left_size > limit {
-                exceeded = true;
+        let mut left_exhausted = false;
+        let mut right_exhausted = false;
+        let mut exceeded = false;
+        let chunk_size = 1000;
+
+        loop {
+            // Read next chunk from left
+            for _ in 0..chunk_size {
+                if let Some(row) = left.next(buffer_pool) {
+                    left_buffered.push(row);
+                    total_size += left_row_size;
+                } else {
+                    left_exhausted = true;
+                    break;
+                }
+            }
+            if left_exhausted || total_size > limit {
+                if total_size > limit { exceeded = true; }
+                break;
+            }
+
+            // Read next chunk from right
+            for _ in 0..chunk_size {
+                if let Some(row) = right.next(buffer_pool) {
+                    right_buffered.push(row);
+                    total_size += right_row_size;
+                } else {
+                    right_exhausted = true;
+                    break;
+                }
+            }
+            if right_exhausted || total_size > limit {
+                if total_size > limit { exceeded = true; }
                 break;
             }
         }
 
         if !exceeded {
-            eprintln!("HashJoin: pure in-memory mode! Buffering left stream ({} rows, ~{} bytes)", left_buffered.len(), left_size);
+            let build_is_left = left_exhausted;
+            let (build_buf, mut probe_buf, probe_child, build_idx) = if build_is_left {
+                (left_buffered, right_buffered, right, left_col_idx)
+            } else {
+                (right_buffered, left_buffered, left, right_col_idx)
+            };
+
             let mut hash_table: HashMap<u64, Vec<Row>> = HashMap::new();
-            for row in left_buffered {
-                let h = hash_data(&row.values[left_col_idx]);
+            for row in build_buf {
+                let h = hash_data(&row.values[build_idx]);
                 hash_table.entry(h).or_default().push(row);
             }
+
+            // Reversing the buffer allows O(1) pops that fetch elements in correct chronological order
+            probe_buf.reverse();
 
             return HashJoinOp {
                 partitions_left: Vec::new(),
@@ -219,19 +251,16 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
                 right_types,
                 left_col_idx,
                 right_col_idx,
-
                 current_partition: 0,
-                build_is_left: true,
+                build_is_left,
                 hash_table,
                 probe_reader: None,
-
                 current_probe_row: None,
                 current_matches: Vec::new(),
                 current_match_idx: 0,
-
                 in_memory_mode: true,
-                right_child: Some(right),
-
+                probe_child: Some(probe_child),
+                probe_buffered: probe_buf,
                 output_schema,
                 output_types,
                 _marker: std::marker::PhantomData,
@@ -240,13 +269,8 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
 
         let num_partitions = 64;
 
-        eprintln!(
-            "HashJoin: memory budget exceeded (> 20MB). Falling back to {} disk partitions",
-            num_partitions
-        );
-
         let partitions_left = partition_input(&mut left, left_col_idx, num_partitions, buffer_pool, left_buffered);
-        let partitions_right = partition_input(&mut right, right_col_idx, num_partitions, buffer_pool, Vec::new());
+        let partitions_right = partition_input(&mut right, right_col_idx, num_partitions, buffer_pool, right_buffered);
 
         HashJoinOp {
             partitions_left,
@@ -255,19 +279,16 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
             right_types,
             left_col_idx,
             right_col_idx,
-
             current_partition: 0,
-            build_is_left: true,
+            build_is_left: true, // For disk mode, partition by partition matching handles optimization natively
             hash_table: HashMap::new(),
             probe_reader: None,
-
             current_probe_row: None,
             current_matches: Vec::new(),
             current_match_idx: 0,
-
             in_memory_mode: false,
-            right_child: None,
-
+            probe_child: None,
+            probe_buffered: Vec::new(),
             output_schema,
             output_types,
             _marker: std::marker::PhantomData,
@@ -280,7 +301,7 @@ impl<R: Read, W: Write> HashJoinOp<R, W> {
 impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
     fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row> {
         loop {
-            // 1. Yield matched build rows one by one (shared logic for both modes)
+            // 1. Yield matched build rows one by one
             if self.current_match_idx < self.current_matches.len() {
                 let build_row = &self.current_matches[self.current_match_idx];
                 self.current_match_idx += 1;
@@ -300,23 +321,32 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
 
             // 1.5. In-Memory Mode Probe
             if self.in_memory_mode {
-                let right = self.right_child.as_mut().unwrap();
-                if let Some(probe_row) = right.next(pool) {
+                let next_probe_row = if let Some(r) = self.probe_buffered.pop() {
+                    Some(r)
+                } else {
+                    let child = self.probe_child.as_mut().unwrap();
+                    child.next(pool)
+                };
+
+                if let Some(probe_row) = next_probe_row {
                     self.current_probe_row = Some(probe_row.clone());
                     self.current_matches.clear();
                     self.current_match_idx = 0;
 
-                    let h = hash_data(&probe_row.values[self.right_col_idx]);
+                    let probe_idx = if self.build_is_left { self.right_col_idx } else { self.left_col_idx };
+                    let build_idx = if self.build_is_left { self.left_col_idx } else { self.right_col_idx };
+
+                    let h = hash_data(&probe_row.values[probe_idx]);
                     if let Some(candidates) = self.hash_table.get(&h) {
                         for build_row in candidates {
-                            if build_row.values[self.left_col_idx] == probe_row.values[self.right_col_idx] {
+                            if build_row.values[build_idx] == probe_row.values[probe_idx] {
                                 self.current_matches.push(build_row.clone());
                             }
                         }
                     }
-                    continue; // Loop back round to yield matched rows
+                    continue; 
                 } else {
-                    return None; // Right child exhausted
+                    return None;
                 }
             }
 
@@ -340,9 +370,8 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
                         }
                     }
                     reader.advance(pool);
-                    continue; // Loop back around to yield matches
+                    continue; 
                 } else {
-                    // Exhausted probe reader
                     if let Some(reader) = self.probe_reader.take() {
                         pool.free_run(&reader.run);
                     }
@@ -351,7 +380,7 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
 
             // 3. Move to next partition pair (Disk Mode)
             if self.current_partition >= self.partitions_left.len() {
-                return None; // Fully exhausted all partitions
+                return None;
             }
 
             let p_idx = self.current_partition;
@@ -369,7 +398,6 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
                         };
                     self.build_is_left = build_is_left;
 
-                    // Load build side into memory hash table
                     let mut build_reader = RunReader::new(build_run, build_types, pool);
                     while let Some(row) = build_reader.peek() {
                         let h = hash_data(&row.values[build_col_idx]);
@@ -378,11 +406,9 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
                     }
                     pool.free_run(build_run);
 
-                    // Prepare probe reader
                     self.probe_reader = Some(RunReader::new(probe_run, probe_types, pool));
                 }
                 (Some(part), None) | (None, Some(part)) => {
-                    // One side is empty, meaning no joins are possible. Free the blocks!
                     pool.free_run(part);
                 }
                 (None, None) => {}
