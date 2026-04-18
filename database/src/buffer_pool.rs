@@ -27,6 +27,8 @@ pub struct BufferPool<R: Read, W: Write> {
     block_size: usize,
     /// Next block ID to hand out from the anonymous (scratch) region.
     next_anon_block_id: Option<u64>,
+    /// Free list of recycled block IDs.
+    free_anon_blocks: Vec<u64>,
 }
 
 impl<R: Read, W: Write> BufferPool<R, W> {
@@ -51,6 +53,7 @@ impl<R: Read, W: Write> BufferPool<R, W> {
             disk_manager,
             block_size,
             next_anon_block_id: None,
+            free_anon_blocks: Vec::new(),
         }
     }
 
@@ -71,6 +74,12 @@ impl<R: Read, W: Write> BufferPool<R, W> {
     /// without advancing it.  This lets callers record a start address before
     /// allocating blocks one-by-one inside a loop.
     pub fn allocate_anon_blocks(&mut self, num_blocks: u64) -> u64 {
+        if num_blocks == 1 {
+            if let Some(recycled_block) = self.free_anon_blocks.pop() {
+                return recycled_block;
+            }
+        }
+
         if self.next_anon_block_id.is_none() {
             self.next_anon_block_id =
                 Some(self.disk_manager.get_anon_start_block().unwrap());
@@ -78,6 +87,13 @@ impl<R: Read, W: Write> BufferPool<R, W> {
         let start = self.next_anon_block_id.unwrap();
         self.next_anon_block_id = Some(start + num_blocks);
         start
+    }
+
+    /// Recycles the block IDs inside the given Run by pushing them to the free list.
+    pub fn free_run(&mut self, run: &crate::disk_run::Run) {
+        for &block_id in &run.block_ids {
+            self.free_anon_blocks.push(block_id);
+        }
     }
 
     // ─── Cached block fetch (LRU) ─────────────────────────────────────────

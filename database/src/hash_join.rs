@@ -41,8 +41,29 @@ pub struct HashJoinOp<R: Read, W: Write> {
 
 // ─── Hashing Helper ──────────────────────────────────────────────────────
 
+struct FnvHasher(u64);
+
+impl Default for FnvHasher {
+    fn default() -> Self {
+        FnvHasher(0xcbf29ce484222325)
+    }
+}
+
+impl Hasher for FnvHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= byte as u64;
+            self.0 = self.0.wrapping_mul(0x100000001b3);
+        }
+    }
+}
+
 fn hash_data(val: &Data) -> u64 {
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut hasher = FnvHasher::default();
     match val {
         Data::Int32(v) => v.hash(&mut hasher),
         Data::Int64(v) => v.hash(&mut hasher),
@@ -66,7 +87,11 @@ fn partition_input<R: Read, W: Write>(
     let mut total_rows: Vec<usize> = vec![0; num_partitions];
 
     let block_size = buffer_pool.block_size();
-    let rows_per_flush = std::cmp::max(block_size / 256, 100);
+    // We have a 64 MB memory budget. Reserving ~15MB for 64 partition buffers
+    // means each bucket can hold ~240KB before flushing.
+    // 4000 rows per flush creates much larger contiguous disk allocation chunks
+    // and drastically reduces seek times from fragmentation.
+    let rows_per_flush = 4000;
 
     while let Some(row) = input.next(buffer_pool) {
         let h = hash_data(&row.values[join_col_idx]);
@@ -212,7 +237,9 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
                     continue; // Loop back around to yield matches
                 } else {
                     // Exhausted probe reader
-                    self.probe_reader = None;
+                    if let Some(reader) = self.probe_reader.take() {
+                        pool.free_run(&reader.run);
+                    }
                 }
             }
 
@@ -242,6 +269,7 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
                     self.hash_table.entry(h).or_default().push(row.clone());
                     build_reader.advance(pool);
                 }
+                pool.free_run(build_run);
 
                 // Prepare probe reader
                 self.probe_reader = Some(RunReader::new(probe_run, probe_types, pool));

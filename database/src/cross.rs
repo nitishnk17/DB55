@@ -78,7 +78,13 @@ impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
         loop {
             let left_row = match &self.current_left_row {
                 Some(row) => row,
-                None => return None,
+                None => {
+                    if !self.right_run.block_ids.is_empty() {
+                        pool.free_run(&self.right_run);
+                        self.right_run.block_ids.clear();
+                    }
+                    return None;
+                }
             };
 
             if self.right_reader.is_none() {
