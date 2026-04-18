@@ -344,11 +344,7 @@ fn merge_k_runs_to_disk(
     let mut offset = 0usize;
     let mut row_count_in_blk: u16 = 0;
 
-    // Reserve contiguous block range: peek at the next anon pointer first (allocate 0),
-    // then allocate blocks 1-at-a-time as we fill them.  The counter is monotonically
-    // increasing so blocks end up contiguous.
-    let start_block = buffer_pool.allocate_anon_blocks(0);
-    let mut num_blocks: u64 = 0;
+    let mut out_block_ids = Vec::new();
     let mut total_rows: usize = 0;
 
     while let Some(entry) = heap.pop() {
@@ -360,7 +356,7 @@ fn merge_k_runs_to_disk(
                 current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
                 let blk = buffer_pool.allocate_anon_blocks(1);
                 buffer_pool.write_block(blk, &current_block);
-                num_blocks += 1;
+                out_block_ids.push(blk);
             }
             current_block = vec![0u8; block_size];
             offset = 0;
@@ -390,11 +386,11 @@ fn merge_k_runs_to_disk(
         current_block[block_size - 2..].copy_from_slice(&row_count_in_blk.to_le_bytes());
         let blk = buffer_pool.allocate_anon_blocks(1);
         buffer_pool.write_block(blk, &current_block);
-        num_blocks += 1;
+        out_block_ids.push(blk);
     }
 
     Run {
-        block_ids: (start_block..start_block+num_blocks).collect(),
+        block_ids: out_block_ids,
         num_rows: total_rows,
     }
 }

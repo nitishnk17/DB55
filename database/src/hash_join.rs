@@ -251,28 +251,35 @@ impl<R: Read, W: Write> Operator<R, W> for HashJoinOp<R, W> {
             let p_idx = self.current_partition;
             self.current_partition += 1;
 
-            if let (Some(left_part), Some(right_part)) = (&self.partitions_left[p_idx], &self.partitions_right[p_idx]) {
-                self.hash_table.clear();
-                
-                let (build_is_left, build_run, probe_run, build_types, probe_types, build_col_idx) =
-                    if left_part.num_rows <= right_part.num_rows {
-                        (true, left_part, right_part, self.left_types.clone(), self.right_types.clone(), self.left_col_idx)
-                    } else {
-                        (false, right_part, left_part, self.right_types.clone(), self.left_types.clone(), self.right_col_idx)
-                    };
-                self.build_is_left = build_is_left;
+            match (&self.partitions_left[p_idx], &self.partitions_right[p_idx]) {
+                (Some(left_part), Some(right_part)) => {
+                    self.hash_table.clear();
+                    
+                    let (build_is_left, build_run, probe_run, build_types, probe_types, build_col_idx) =
+                        if left_part.num_rows <= right_part.num_rows {
+                            (true, left_part, right_part, self.left_types.clone(), self.right_types.clone(), self.left_col_idx)
+                        } else {
+                            (false, right_part, left_part, self.right_types.clone(), self.left_types.clone(), self.right_col_idx)
+                        };
+                    self.build_is_left = build_is_left;
 
-                // Load build side into memory hash table
-                let mut build_reader = RunReader::new(build_run, build_types, pool);
-                while let Some(row) = build_reader.peek() {
-                    let h = hash_data(&row.values[build_col_idx]);
-                    self.hash_table.entry(h).or_default().push(row.clone());
-                    build_reader.advance(pool);
+                    // Load build side into memory hash table
+                    let mut build_reader = RunReader::new(build_run, build_types, pool);
+                    while let Some(row) = build_reader.peek() {
+                        let h = hash_data(&row.values[build_col_idx]);
+                        self.hash_table.entry(h).or_default().push(row.clone());
+                        build_reader.advance(pool);
+                    }
+                    pool.free_run(build_run);
+
+                    // Prepare probe reader
+                    self.probe_reader = Some(RunReader::new(probe_run, probe_types, pool));
                 }
-                pool.free_run(build_run);
-
-                // Prepare probe reader
-                self.probe_reader = Some(RunReader::new(probe_run, probe_types, pool));
+                (Some(part), None) | (None, Some(part)) => {
+                    // One side is empty, meaning no joins are possible. Free the blocks!
+                    pool.free_run(part);
+                }
+                (None, None) => {}
             }
         }
     }

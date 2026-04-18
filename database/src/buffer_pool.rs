@@ -93,6 +93,11 @@ impl<R: Read, W: Write> BufferPool<R, W> {
     pub fn free_run(&mut self, run: &crate::disk_run::Run) {
         for &block_id in &run.block_ids {
             self.free_anon_blocks.push(block_id);
+            // Invalidate the cache to prevent stale reads of recycled blocks!
+            if let Some(frame_idx) = self.page_table.remove(&block_id) {
+                self.frames[frame_idx].block_id = None;
+                self.frames[frame_idx].dirty = false;
+            }
         }
     }
 
@@ -172,6 +177,11 @@ impl<R: Read, W: Write> BufferPool<R, W> {
     /// Used when writing sorted runs / hash-join partitions to scratch space.
     pub fn write_block(&mut self, block_id: u64, data: &[u8]) {
         self.disk_manager.write_blocks(block_id, data).unwrap();
+        // Cache coherency fix: if the block was previously in the cache, invalidate it.
+        if let Some(frame_idx) = self.page_table.remove(&block_id) {
+            self.frames[frame_idx].block_id = None;
+            self.frames[frame_idx].dirty = false;
+        }
     }
 
     // ─── LRU eviction ─────────────────────────────────────────────────────
