@@ -83,7 +83,8 @@ impl RunReader {
             buffer_pool.unpin(run.block_ids[0]);
             b
         };
-        let rows = if run.block_ids.is_empty() { vec![] } else { decode_block(&block_data, &types) };
+        let all_needed: Vec<usize> = (0..types.len()).collect();
+        let rows = if run.block_ids.is_empty() { vec![] } else { decode_block(&block_data, &types, &all_needed) };
 
         RunReader {
             run: run.clone(),
@@ -113,7 +114,8 @@ impl RunReader {
             let block_id = self.run.block_ids[self.current_block_idx];
             let block_data = buffer_pool.fetch_block(block_id);
             buffer_pool.unpin(block_id);
-            self.current_block_rows = decode_block(&block_data, &self.types);
+            let all_needed: Vec<usize> = (0..self.types.len()).collect();
+            self.current_block_rows = decode_block(&block_data, &self.types, &all_needed);
             self.current_row_idx = 0;
         }
     }

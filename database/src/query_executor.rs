@@ -40,10 +40,22 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                 .iter()
                 .find(|t| t.name == scan_data.table_id)
                 .unwrap_or_else(|| panic!("Table '{}' not found", scan_data.table_id));
+
+            let mut needed_indices = Vec::new();
+            for (i, cs) in table_spec.column_specs.iter().enumerate() {
+                if global_needed.contains(&cs.column_name) || global_needed.is_empty() {
+                    needed_indices.push(i);
+                }
+            }
+            if needed_indices.is_empty() && !table_spec.column_specs.is_empty() {
+                needed_indices.push(0);
+            }
+
             Box::new(TableScanner::new(
                 buffer_pool,
                 &table_spec.file_id,
                 &table_spec.column_specs,
+                needed_indices,
             ))
         }
 

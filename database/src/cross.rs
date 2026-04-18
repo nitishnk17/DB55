@@ -9,8 +9,11 @@ use crate::buffer_pool::BufferPool;
 pub struct CrossOp<R: Read, W: Write> {
     left: Box<dyn Operator<R, W>>,
     right_run: Run,
+    right_rows_mem: Vec<Row>,
+    in_memory_mode: bool,
     current_left_row: Option<Row>,
     right_reader: Option<RunReader>,
+    current_mem_right_idx: usize,
     right_types: Vec<DataType>,
     output_schema: Vec<String>,
     output_types: Vec<DataType>,
@@ -25,26 +28,32 @@ impl<R: Read, W: Write> CrossOp<R, W> {
         output_types.extend(right.data_types());
         let right_types = right.data_types();
 
-        // Materialize right child sequentially into a Run (out-of-core)
-        let block_size = pool.block_size();
-        let chunk_size = std::cmp::max((100 * block_size) / 256, 100);
-        let mut block_ids = Vec::new();
-        let mut total_right_rows = 0;
+        let mut right_rows_mem = Vec::new();
+        let limit = 10_000;
+        let mut exceeded = false;
 
-        loop {
-            let mut right_chunk = Vec::new();
-            for _ in 0..chunk_size {
-                if let Some(row) = right.next(pool) {
-                    right_chunk.push(row);
-                } else {
-                    break;
-                }
-            }
-            if right_chunk.is_empty() {
+        while let Some(row) = right.next(pool) {
+            right_rows_mem.push(row);
+            if right_rows_mem.len() >= limit {
+                exceeded = true;
                 break;
             }
-            total_right_rows += right_chunk.len();
-            let blocks = rows_to_blocks(&right_chunk, block_size);
+        }
+
+        let in_memory_mode: bool;
+        let mut right_run = Run { block_ids: vec![], num_rows: 0 };
+
+        if !exceeded {
+            in_memory_mode = true;
+        } else {
+            in_memory_mode = false;
+            let block_size = pool.block_size();
+            let chunk_size = std::cmp::max((100 * block_size) / 256, 100);
+            let mut block_ids = Vec::new();
+            let mut total_right_rows = 0;
+
+            // Write initial 10,000 rows
+            let blocks = rows_to_blocks(&right_rows_mem, block_size);
             let num_blocks = blocks.len() as u64;
             let start_block = pool.allocate_anon_blocks(num_blocks);
             for (i, block_data) in blocks.iter().enumerate() {
@@ -52,20 +61,49 @@ impl<R: Read, W: Write> CrossOp<R, W> {
                 pool.write_block(bid, block_data);
                 block_ids.push(bid);
             }
-        }
+            total_right_rows += right_rows_mem.len();
+            right_rows_mem.clear(); // Free memory
 
-        let right_run = Run {
-            block_ids,
-            num_rows: total_right_rows,
-        };
+            // Stream the rest
+            loop {
+                let mut right_chunk = Vec::new();
+                for _ in 0..chunk_size {
+                    if let Some(row) = right.next(pool) {
+                        right_chunk.push(row);
+                    } else {
+                        break;
+                    }
+                }
+                if right_chunk.is_empty() {
+                    break;
+                }
+                total_right_rows += right_chunk.len();
+                let blocks = rows_to_blocks(&right_chunk, block_size);
+                let num_blocks = blocks.len() as u64;
+                let start_block = pool.allocate_anon_blocks(num_blocks);
+                for (i, block_data) in blocks.iter().enumerate() {
+                    let bid = start_block + i as u64;
+                    pool.write_block(bid, block_data);
+                    block_ids.push(bid);
+                }
+            }
+
+            right_run = Run {
+                block_ids,
+                num_rows: total_right_rows,
+            };
+        }
 
         let current_left_row = left.next(pool);
 
         CrossOp {
             left,
             right_run,
+            right_rows_mem,
+            in_memory_mode,
             current_left_row,
             right_reader: None,
+            current_mem_right_idx: 0,
             right_types,
             output_schema,
             output_types,
@@ -79,7 +117,7 @@ impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
             let left_row = match &self.current_left_row {
                 Some(row) => row,
                 None => {
-                    if !self.right_run.block_ids.is_empty() {
+                    if !self.in_memory_mode && !self.right_run.block_ids.is_empty() {
                         pool.free_run(&self.right_run);
                         self.right_run.block_ids.clear();
                     }
@@ -87,22 +125,36 @@ impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
                 }
             };
 
-            if self.right_reader.is_none() {
-                self.right_reader = Some(RunReader::new(&self.right_run, self.right_types.clone(), pool));
+            if self.in_memory_mode {
+                if self.current_mem_right_idx < self.right_rows_mem.len() {
+                    let right_row = &self.right_rows_mem[self.current_mem_right_idx];
+                    self.current_mem_right_idx += 1;
+                    
+                    let mut combined = left_row.values.clone();
+                    combined.extend(right_row.values.clone());
+                    return Some(Row { values: combined });
+                } else {
+                    self.current_left_row = self.left.next(pool);
+                    self.current_mem_right_idx = 0;
+                }
+            } else {
+                if self.right_reader.is_none() {
+                    self.right_reader = Some(RunReader::new(&self.right_run, self.right_types.clone(), pool));
+                }
+
+                let reader = self.right_reader.as_mut().unwrap();
+
+                if let Some(right_row) = reader.peek() {
+                    let mut combined = left_row.values.clone();
+                    combined.extend(right_row.values.clone());
+                    reader.advance(pool);
+                    return Some(Row { values: combined });
+                }
+
+                // Right run exhausted for this left row, advance left
+                self.current_left_row = self.left.next(pool);
+                self.right_reader = None;
             }
-
-            let reader = self.right_reader.as_mut().unwrap();
-
-            if let Some(right_row) = reader.peek() {
-                let mut combined = left_row.values.clone();
-                combined.extend(right_row.values.clone());
-                reader.advance(pool);
-                return Some(Row { values: combined });
-            }
-
-            // Right run exhausted for this left row, advance left
-            self.current_left_row = self.left.next(pool);
-            self.right_reader = None;
         }
     }
 

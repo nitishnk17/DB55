@@ -9,6 +9,8 @@ use std::collections::VecDeque;
 pub struct TableScanner {
     column_names: Vec<String>,
     column_types: Vec<DataType>,
+    all_types: Vec<DataType>,
+    needed_column_indices: Vec<usize>,
     start_block: u64,
     num_blocks: u64,
     current_block: u64,
@@ -20,15 +22,20 @@ impl TableScanner {
         buffer_pool: &mut BufferPool<impl Read, impl Write>,
         file_id: &str,
         column_specs: &[ColumnSpec],
+        needed_column_indices: Vec<usize>,
     ) -> Self {
         let start_block = buffer_pool.get_file_start_block(file_id);
         let num_blocks  = buffer_pool.get_file_num_blocks(file_id);
 
-        let column_names = column_specs
-            .iter()
-            .map(|c| c.column_name.clone())
-            .collect();
-        let column_types = column_specs
+        let mut column_names: Vec<String> = Vec::new();
+        let mut column_types: Vec<DataType> = Vec::new();
+
+        for &idx in &needed_column_indices {
+            column_names.push(column_specs[idx].column_name.clone());
+            column_types.push(column_specs[idx].data_type.clone());
+        }
+
+        let all_types = column_specs
             .iter()
             .map(|c| c.data_type.clone())
             .collect();
@@ -36,6 +43,8 @@ impl TableScanner {
         TableScanner {
             column_names,
             column_types,
+            all_types,
+            needed_column_indices,
             start_block,
             num_blocks,
             current_block: start_block,
@@ -68,7 +77,7 @@ impl<R: Read, W: Write> Operator<R, W> for TableScanner {
                 let begin = i * block_size;
                 let end   = begin + block_size;
                 let block_data = &raw[begin..end];
-                let rows = decode_block(block_data, &self.column_types);
+                let rows = decode_block(block_data, &self.all_types, &self.needed_column_indices);
                 for r in rows {
                     self.batch_rows.push_back(r);
                 }

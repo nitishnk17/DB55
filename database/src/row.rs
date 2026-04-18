@@ -5,35 +5,46 @@ pub struct Row{
     pub values: Vec<Data>,
 }
 
-pub fn decode_row(bytes: &[u8], types: &[DataType]) -> (Row, usize){
+pub fn decode_row(bytes: &[u8], types: &[DataType], needed: &[usize]) -> (Row, usize){
     let mut values = Vec::new();
     let mut offset = 0;
-    for dt in types {
+    for (i, dt) in types.iter().enumerate() {
+        let is_needed = needed.contains(&i);
         match dt {
             DataType::Int32 => {
-                let val = i32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap());
-                values.push(Data::Int32(val));
+                if is_needed {
+                    let val = i32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap());
+                    values.push(Data::Int32(val));
+                }
                 offset += 4;
             }
             DataType::Int64 => {
-                let val = i64::from_le_bytes(bytes[offset..offset+8].try_into().unwrap());
-                values.push(Data::Int64(val));
+                if is_needed {
+                    let val = i64::from_le_bytes(bytes[offset..offset+8].try_into().unwrap());
+                    values.push(Data::Int64(val));
+                }
                 offset += 8;
             }
             DataType::Float32 => {
-                let val = f32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap());
-                values.push(Data::Float32(val));
+                if is_needed {
+                    let val = f32::from_le_bytes(bytes[offset..offset+4].try_into().unwrap());
+                    values.push(Data::Float32(val));
+                }
                 offset += 4;
             }
             DataType::Float64 => {
-                let val = f64::from_le_bytes(bytes[offset..offset+8].try_into().unwrap());
-                values.push(Data::Float64(val));
+                if is_needed {
+                    let val = f64::from_le_bytes(bytes[offset..offset+8].try_into().unwrap());
+                    values.push(Data::Float64(val));
+                }
                 offset += 8;
             }
             DataType::String => {
                 let end = bytes[offset..].iter().position(|&b| b == 0).unwrap();
-                let val = String::from_utf8(bytes[offset..offset+end].to_vec()).unwrap();
-                values.push(Data::String(val));
+                if is_needed {
+                    let val = String::from_utf8(bytes[offset..offset+end].to_vec()).unwrap();
+                    values.push(Data::String(val));
+                }
                 offset += end + 1;
             }
         }
@@ -75,7 +86,7 @@ fn format_float(v: f64) -> String {
         let len = libc::snprintf(
             buffer.as_mut_ptr() as *mut libc::c_char,
             buffer.len(),
-            b"%.15g\0".as_ptr() as *const libc::c_char,
+            c"%.15g".as_ptr() as *const libc::c_char,
             v
         );
         std::str::from_utf8_unchecked(&buffer[..len as usize]).to_string()
@@ -89,12 +100,12 @@ fn format_float(v: f64) -> String {
     }
 }
 
-pub fn decode_block(block_data: &[u8], types: &[DataType]) -> Vec<Row> {
+pub fn decode_block(block_data: &[u8], types: &[DataType], needed: &[usize]) -> Vec<Row> {
     let row_count = u16::from_le_bytes(block_data[block_data.len()-2..].try_into().unwrap());
     let mut rows = Vec::new();
     let mut offset = 0;
     for _ in 0..row_count {
-        let (row, row_len) = decode_row(&block_data[offset..], types);
+        let (row, row_len) = decode_row(&block_data[offset..], types, needed);
         rows.push(row);
         offset += row_len;
     }
