@@ -14,6 +14,8 @@ pub struct CrossOp<R: Read, W: Write> {
     current_left_row: Option<Row>,
     right_reader: Option<RunReader>,
     current_mem_right_idx: usize,
+    left_chunk: Vec<Row>,
+    chunk_left_idx: usize,
     right_types: Vec<DataType>,
     output_schema: Vec<String>,
     output_types: Vec<DataType>,
@@ -104,6 +106,8 @@ impl<R: Read, W: Write> CrossOp<R, W> {
             current_left_row,
             right_reader: None,
             current_mem_right_idx: 0,
+            left_chunk: Vec::new(),
+            chunk_left_idx: 0,
             right_types,
             output_schema,
             output_types,
@@ -114,18 +118,12 @@ impl<R: Read, W: Write> CrossOp<R, W> {
 impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
     fn next(&mut self, pool: &mut BufferPool<R, W>) -> Option<Row> {
         loop {
-            let left_row = match &self.current_left_row {
-                Some(row) => row,
-                None => {
-                    if !self.in_memory_mode && !self.right_run.block_ids.is_empty() {
-                        pool.free_run(&self.right_run);
-                        self.right_run.block_ids.clear();
-                    }
-                    return None;
-                }
-            };
-
             if self.in_memory_mode {
+                let left_row = match &self.current_left_row {
+                    Some(row) => row,
+                    None => return None,
+                };
+
                 if self.current_mem_right_idx < self.right_rows_mem.len() {
                     let right_row = &self.right_rows_mem[self.current_mem_right_idx];
                     self.current_mem_right_idx += 1;
@@ -138,6 +136,24 @@ impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
                     self.current_mem_right_idx = 0;
                 }
             } else {
+                // Disk Mode (Chunked BNLJ)
+                if self.left_chunk.is_empty() {
+                    for _ in 0..5000 {
+                        if let Some(row) = self.left.next(pool) {
+                            self.left_chunk.push(row);
+                        } else {
+                            break;
+                        }
+                    }
+                    if self.left_chunk.is_empty() {
+                        if !self.right_run.block_ids.is_empty() {
+                            pool.free_run(&self.right_run);
+                            self.right_run.block_ids.clear();
+                        }
+                        return None;
+                    }
+                }
+
                 if self.right_reader.is_none() {
                     self.right_reader = Some(RunReader::new(&self.right_run, self.right_types.clone(), pool));
                 }
@@ -145,15 +161,22 @@ impl<R: Read, W: Write> Operator<R, W> for CrossOp<R, W> {
                 let reader = self.right_reader.as_mut().unwrap();
 
                 if let Some(right_row) = reader.peek() {
+                    let left_row = &self.left_chunk[self.chunk_left_idx];
                     let mut combined = left_row.values.clone();
                     combined.extend(right_row.values.clone());
-                    reader.advance(pool);
+                    
+                    self.chunk_left_idx += 1;
+                    
+                    if self.chunk_left_idx == self.left_chunk.len() {
+                        self.chunk_left_idx = 0;
+                        reader.advance(pool);
+                    }
                     return Some(Row { values: combined });
                 }
 
-                // Right run exhausted for this left row, advance left
-                self.current_left_row = self.left.next(pool);
+                // Exhausted right run. Reset for next chunk!
                 self.right_reader = None;
+                self.left_chunk.clear();
             }
         }
     }
