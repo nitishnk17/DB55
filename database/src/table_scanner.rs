@@ -47,66 +47,102 @@ impl TableScanner {
         if let Some(pred) = pushed_predicate {
             if let Some(idx) = column_specs.iter().position(|c| c.column_name == pred.column_name) {
                 let spec = &column_specs[idx];
-                let is_ordered = spec.stats.as_ref().map_or(false, |stats| {
-                    stats.iter().any(|s| matches!(s, ColumnStat::IsPhysicallyOrdered))
-                });
-
-                if is_ordered {
-                    eprintln!("TableScanner: Using binary search on '{}' for {:?}", pred.column_name, pred.operator);
-                    
-                    let cmp = |row_val: &Data| -> std::cmp::Ordering {
-                        match (&pred.value, row_val) {
-                            (ComparisionValue::I32(c), Data::Int32(r)) => r.cmp(c),
-                            (ComparisionValue::I64(c), Data::Int64(r)) => r.cmp(c),
-                            (ComparisionValue::F32(c), Data::Float32(r)) => r.total_cmp(c),
-                            (ComparisionValue::F64(c), Data::Float64(r)) => r.total_cmp(c),
-                            (ComparisionValue::String(c), Data::String(r)) => r.cmp(c),
-                            _ => std::cmp::Ordering::Equal,
-                        }
-                    };
-
-                    // For EQ, GT, GTE: find lower bound block
-                    if matches!(pred.operator, ComparisionOperator::EQ | ComparisionOperator::GT | ComparisionOperator::GTE) {
-                        let mut low = scan_start_block;
-                        let mut high = scan_end_block;
-                        while low < high {
-                            let mid = low + (high - low) / 2;
-                            let raw = buffer_pool.read_blocks_sequential(mid, 1);
-                            let rows = decode_block(&raw, &all_types, &[idx]);
-                            
-                            if let Some(last_row) = rows.last() {
-                                if cmp(&last_row.values[0]) == std::cmp::Ordering::Less {
-                                    low = mid + 1;
-                                } else {
-                                    high = mid;
-                                }
-                            } else {
-                                break;
-                            }
-                        }
-                        scan_start_block = low;
+                
+                let cmp = |row_val: &Data| -> std::cmp::Ordering {
+                    match (&pred.value, row_val) {
+                        (ComparisionValue::I32(c), Data::Int32(r)) => r.cmp(c),
+                        (ComparisionValue::I64(c), Data::Int64(r)) => r.cmp(c),
+                        (ComparisionValue::F32(c), Data::Float32(r)) => r.total_cmp(c),
+                        (ComparisionValue::F64(c), Data::Float64(r)) => r.total_cmp(c),
+                        (ComparisionValue::String(c), Data::String(r)) => r.cmp(c),
+                        _ => std::cmp::Ordering::Equal,
                     }
+                };
 
-                    // For EQ, LT, LTE: find upper bound block
-                    if matches!(pred.operator, ComparisionOperator::EQ | ComparisionOperator::LT | ComparisionOperator::LTE) {
-                        let mut low = scan_start_block;
-                        let mut high = scan_end_block;
-                        while low < high {
-                            let mid = low + (high - low) / 2;
-                            let raw = buffer_pool.read_blocks_sequential(mid, 1);
-                            let rows = decode_block(&raw, &all_types, &[idx]);
-                            
-                            if let Some(first_row) = rows.first() {
-                                if cmp(&first_row.values[0]) == std::cmp::Ordering::Greater {
-                                    high = mid;
-                                } else {
-                                    low = mid + 1;
+                // O(1) Range Pruning
+                let mut impossible = false;
+                if let Some(stats) = &spec.stats {
+                    for stat in stats {
+                        if let ColumnStat::RangeStat(range) = stat {
+                            let order_lower = cmp(&range.lower_bound);
+                            let order_upper = cmp(&range.upper_bound);
+
+                            match pred.operator {
+                                ComparisionOperator::GT | ComparisionOperator::GTE => {
+                                    if order_upper == std::cmp::Ordering::Less || (matches!(pred.operator, ComparisionOperator::GT) && order_upper == std::cmp::Ordering::Equal) {
+                                        impossible = true;
+                                    }
                                 }
-                            } else {
-                                break;
+                                ComparisionOperator::LT | ComparisionOperator::LTE => {
+                                    if order_lower == std::cmp::Ordering::Greater || (matches!(pred.operator, ComparisionOperator::LT) && order_lower == std::cmp::Ordering::Equal) {
+                                        impossible = true;
+                                    }
+                                }
+                                ComparisionOperator::EQ => {
+                                    if order_lower == std::cmp::Ordering::Greater || order_upper == std::cmp::Ordering::Less {
+                                        impossible = true;
+                                    }
+                                }
+                                _ => {}
                             }
                         }
-                        scan_end_block = low; // exclusive end block
+                    }
+                }
+
+                if impossible {
+                    eprintln!("TableScanner: O(1) RangeStat pruning active. Zero reads required.");
+                    scan_end_block = scan_start_block;
+                } else {
+                    let is_ordered = spec.stats.as_ref().map_or(false, |stats| {
+                        stats.iter().any(|s| matches!(s, ColumnStat::IsPhysicallyOrdered))
+                    });
+
+                    if is_ordered {
+                        eprintln!("TableScanner: Using binary search on '{}' for {:?}", pred.column_name, pred.operator);
+                        
+                        // For EQ, GT, GTE: find lower bound block
+                        if matches!(pred.operator, ComparisionOperator::EQ | ComparisionOperator::GT | ComparisionOperator::GTE) {
+                            let mut low = scan_start_block;
+                            let mut high = scan_end_block;
+                            while low < high {
+                                let mid = low + (high - low) / 2;
+                                let raw = buffer_pool.read_blocks_sequential(mid, 1);
+                                let rows = decode_block(&raw, &all_types, &[idx]);
+                                
+                                if let Some(last_row) = rows.last() {
+                                    if cmp(&last_row.values[0]) == std::cmp::Ordering::Less {
+                                        low = mid + 1;
+                                    } else {
+                                        high = mid;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            scan_start_block = low;
+                        }
+
+                        // For EQ, LT, LTE: find upper bound block
+                        if matches!(pred.operator, ComparisionOperator::EQ | ComparisionOperator::LT | ComparisionOperator::LTE) {
+                            let mut low = scan_start_block;
+                            let mut high = scan_end_block;
+                            while low < high {
+                                let mid = low + (high - low) / 2;
+                                let raw = buffer_pool.read_blocks_sequential(mid, 1);
+                                let rows = decode_block(&raw, &all_types, &[idx]);
+                                
+                                if let Some(first_row) = rows.first() {
+                                    if cmp(&first_row.values[0]) == std::cmp::Ordering::Greater {
+                                        high = mid;
+                                    } else {
+                                        low = mid + 1;
+                                    }
+                                } else {
+                                    break;
+                                }
+                            }
+                            scan_end_block = low; // exclusive end block
+                        }
                     }
                 }
             }
