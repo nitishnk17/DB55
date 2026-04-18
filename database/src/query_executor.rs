@@ -23,7 +23,22 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
     sort_memory_bytes: usize,
 ) -> Box<dyn Operator<R, W>> {
     let global_needed = get_all_used_columns(query_op);
-    build_operator_internal(query_op, ctx, buffer_pool, sort_memory_bytes, &global_needed)
+    build_operator_internal(query_op, ctx, buffer_pool, sort_memory_bytes, &global_needed, None)
+}
+
+fn extract_pushed_predicate(preds: &[Predicate]) -> Option<Predicate> {
+    for p in preds {
+        if !matches!(p.value, ComparisionValue::Column(_)) {
+            match p.operator {
+                ComparisionOperator::EQ | ComparisionOperator::LT | ComparisionOperator::LTE |
+                ComparisionOperator::GT | ComparisionOperator::GTE => {
+                    return Some(clone_predicate(p));
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
@@ -32,6 +47,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
     buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
     global_needed: &std::collections::HashSet<String>,
+    pushed_predicate: Option<Predicate>,
 ) -> Box<dyn Operator<R, W>> {
     match query_op {
         QueryOp::Scan(scan_data) => {
@@ -56,6 +72,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                 &table_spec.file_id,
                 &table_spec.column_specs,
                 needed_indices,
+                pushed_predicate,
             ))
         }
 
@@ -213,24 +230,25 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
             }
 
             // Standard filter (no join rewrite)
-            let child = build_operator_internal(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
-            let preds = filter_data.predicates.iter().map(|p| clone_predicate(p)).collect();
+            let preds: Vec<Predicate> = filter_data.predicates.iter().map(|p| clone_predicate(p)).collect();
+            let pushed = extract_pushed_predicate(&preds);
+            let child = build_operator_internal(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, pushed);
             Box::new(FilterOp::new(child, preds))
         }
 
         QueryOp::Project(project_data) => {
-            let child = build_operator_internal(&project_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
+            let child = build_operator_internal(&project_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, None);
             Box::new(ProjectOp::new(child, project_data.column_name_map.clone()))
         }
 
         QueryOp::Cross(cross_data) => {
-            let left  = build_operator_internal(&cross_data.left,  ctx, buffer_pool, sort_memory_bytes, global_needed);
-            let right = build_operator_internal(&cross_data.right, ctx, buffer_pool, sort_memory_bytes, global_needed);
+            let left  = build_operator_internal(&cross_data.left,  ctx, buffer_pool, sort_memory_bytes, global_needed, None);
+            let right = build_operator_internal(&cross_data.right, ctx, buffer_pool, sort_memory_bytes, global_needed, None);
             Box::new(CrossOp::new(left, right, buffer_pool))
         }
 
         QueryOp::Sort(sort_data) => {
-            let child = build_operator_internal(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed);
+            let child = build_operator_internal(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, None);
             let data_types = child.data_types();
             Box::new(SortOp::new(
                 child,
@@ -349,7 +367,8 @@ fn build_leaf_with_filter<R: Read + 'static, W: Write + 'static>(
     buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
 ) -> Box<dyn Operator<R, W>> {
-    let mut op = build_operator_internal(leaf, ctx, buffer_pool, sort_memory_bytes, global_needed);
+    let pushed = extract_pushed_predicate(scalar_preds);
+    let mut op = build_operator_internal(leaf, ctx, buffer_pool, sort_memory_bytes, global_needed, pushed);
 
     if !scalar_preds.is_empty() {
         let preds: Vec<Predicate> = scalar_preds.iter().map(|p| clone_predicate(p)).collect();
