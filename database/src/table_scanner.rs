@@ -25,7 +25,7 @@ impl TableScanner {
         file_id: &str,
         column_specs: &[ColumnSpec],
         needed_column_indices: Vec<usize>,
-        pushed_predicate: Option<Predicate>,
+        pushed_predicates: Vec<Predicate>,
     ) -> Self {
         let mut scan_start_block = buffer_pool.get_file_start_block(file_id);
         let mut scan_end_block  = scan_start_block + buffer_pool.get_file_num_blocks(file_id);
@@ -44,7 +44,7 @@ impl TableScanner {
             .collect();
 
         // ── Binary Search Optimization ─────────────────────────────────────
-        if let Some(pred) = pushed_predicate {
+        for pred in pushed_predicates {
             if let Some(idx) = column_specs.iter().position(|c| c.column_name == pred.column_name) {
                 let spec = &column_specs[idx];
                 
@@ -92,6 +92,7 @@ impl TableScanner {
                 if impossible {
                     eprintln!("TableScanner: O(1) RangeStat pruning active. Zero reads required.");
                     scan_end_block = scan_start_block;
+                    break;
                 } else {
                     let is_ordered = spec.stats.as_ref().map_or(false, |stats| {
                         stats.iter().any(|s| matches!(s, ColumnStat::IsPhysicallyOrdered))
@@ -119,7 +120,7 @@ impl TableScanner {
                                     break;
                                 }
                             }
-                            scan_start_block = low;
+                            scan_start_block = scan_start_block.max(low);
                         }
 
                         // For EQ, LT, LTE: find upper bound block
@@ -141,7 +142,7 @@ impl TableScanner {
                                     break;
                                 }
                             }
-                            scan_end_block = low; // exclusive end block
+                            scan_end_block = scan_end_block.min(low); // exclusive end block
                         }
                     }
                 }

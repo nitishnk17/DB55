@@ -23,37 +23,7 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
     sort_memory_bytes: usize,
 ) -> Box<dyn Operator<R, W>> {
     let global_needed = get_all_used_columns(query_op);
-    build_operator_internal(query_op, ctx, buffer_pool, sort_memory_bytes, &global_needed, None)
-}
-
-fn extract_pushed_predicate(preds: &[Predicate], ctx: &DbContext) -> Option<Predicate> {
-    let mut fallback = None;
-    for p in preds {
-        if !matches!(p.value, ComparisionValue::Column(_)) {
-            match p.operator {
-                ComparisionOperator::EQ | ComparisionOperator::LT | ComparisionOperator::LTE |
-                ComparisionOperator::GT | ComparisionOperator::GTE => {
-                    if fallback.is_none() {
-                        fallback = Some(clone_predicate(p));
-                    }
-
-                    for table in ctx.get_table_specs() {
-                        for cs in &table.column_specs {
-                            if cs.column_name == p.column_name {
-                                if let Some(stats) = &cs.stats {
-                                    if stats.iter().any(|s| matches!(s, ColumnStat::IsPhysicallyOrdered)) {
-                                        return Some(clone_predicate(p));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-    fallback
+    build_operator_internal(query_op, ctx, buffer_pool, sort_memory_bytes, &global_needed, Vec::new())
 }
 
 fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
@@ -62,7 +32,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
     buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
     global_needed: &std::collections::HashSet<String>,
-    pushed_predicate: Option<Predicate>,
+    pushed_predicates: Vec<Predicate>,
 ) -> Box<dyn Operator<R, W>> {
     match query_op {
         QueryOp::Scan(scan_data) => {
@@ -87,7 +57,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                 &table_spec.file_id,
                 &table_spec.column_specs,
                 needed_indices,
-                pushed_predicate,
+                pushed_predicates,
             ))
         }
 
@@ -169,62 +139,89 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
                 let mut current_schema = leaf_schemas[start_idx].clone();
 
                 while joined.iter().any(|&m| !m) {
-                    // Find next leaf connected to current result by an EQ join pred
-                    let mut found = false;
-                    'search: for leaf_idx in 0..leaves.len() {
+                    let mut best_leaf_idx = None;
+                    let mut best_pred_idx = None;
+                    let mut min_card = u64::MAX;
+
+                    for leaf_idx in 0..leaves.len() {
                         if joined[leaf_idx] { continue; }
                         let new_schema = &leaf_schemas[leaf_idx];
+                        
                         for pred_idx in 0..remaining_preds.len() {
                             let is_eq = matches!(remaining_preds[pred_idx].operator, ComparisionOperator::EQ);
                             if !is_eq { continue; }
-                            // Extract column names without borrowing remaining_preds across remove()
+                            
                             let col_a = remaining_preds[pred_idx].column_name.clone();
                             let col_b_opt = match &remaining_preds[pred_idx].value {
                                 ComparisionValue::Column(c) => Some(c.clone()),
                                 _ => None,
                             };
+                            
                             if let Some(col_b) = col_b_opt {
                                 let a_cur = current_schema.contains(&col_a);
                                 let b_new = new_schema.contains(&col_b);
                                 let b_cur = current_schema.contains(&col_b);
                                 let a_new = new_schema.contains(&col_a);
+                                
                                 if (a_cur && b_new) || (b_cur && a_new) {
-                                    // Build this leaf with its pushed-down scalar preds
-                                    let right_op = build_leaf_with_filter(
-                                        leaves[leaf_idx], &scalar_preds[leaf_idx], &global_needed,
-                                        ctx, buffer_pool, sort_memory_bytes);
-                                    let right_schema = right_op.schema();
-                                    let l_actual_schema = current_op.schema();
-                                    let (l_idx, r_idx) = if a_cur && b_new {
-                                        (l_actual_schema.iter().position(|x| x == &col_a).unwrap(),
-                                         right_schema.iter().position(|x| x == &col_b).unwrap())
-                                    } else {
-                                        (l_actual_schema.iter().position(|x| x == &col_b).unwrap(),
-                                         right_schema.iter().position(|x| x == &col_a).unwrap())
-                                    };
-                                    // Use data_types() from the operators directly
-                                    let ldt = current_op.data_types();
-                                    let rdt = right_op.data_types();
-
-                                    current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
-                                        eprintln!("Join strategy: Grace Hash Join (Setting LRU cache)");
-                                        buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::LRU);
-                                        Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, ldt, rdt, buffer_pool))
-                                    } else {
-                                        eprintln!("Join strategy: Block Nested Loop Join (Setting MRU cache)");
-                                        buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::MRU);
-                                        Box::new(crate::join::JoinOp::new(current_op, right_op, l_idx, r_idx, rdt, buffer_pool))
-                                    };
-                                    current_schema.extend(right_schema);
-                                    joined[leaf_idx] = true;
-                                    remaining_preds.remove(pred_idx);
-                                    found = true;
-                                    break 'search;
+                                    let base_est = estimate_cardinality(new_schema, ctx).unwrap_or(u64::MAX);
+                                    let est = if !scalar_preds[leaf_idx].is_empty() { base_est / 10 } else { base_est };
+                                    
+                                    if est < min_card {
+                                        min_card = est;
+                                        best_leaf_idx = Some(leaf_idx);
+                                        best_pred_idx = Some(pred_idx);
+                                    }
                                 }
                             }
                         }
                     }
-                    if !found {
+
+                    if let Some(leaf_idx) = best_leaf_idx {
+                        let pred_idx = best_pred_idx.unwrap();
+                        let new_schema = &leaf_schemas[leaf_idx];
+                        
+                        let col_a = remaining_preds[pred_idx].column_name.clone();
+                        let col_b = match &remaining_preds[pred_idx].value {
+                            ComparisionValue::Column(c) => c.clone(),
+                            _ => unreachable!(),
+                        };
+                        
+                        let a_cur = current_schema.contains(&col_a);
+                        let b_new = new_schema.contains(&col_b);
+
+                        let right_op = build_leaf_with_filter(
+                            leaves[leaf_idx], &scalar_preds[leaf_idx], &global_needed,
+                            ctx, buffer_pool, sort_memory_bytes);
+                        
+                        let right_schema = right_op.schema();
+                        let l_actual_schema = current_op.schema();
+                        
+                        let (l_idx, r_idx) = if a_cur && b_new {
+                            (l_actual_schema.iter().position(|x| x == &col_a).unwrap(),
+                             right_schema.iter().position(|x| x == &col_b).unwrap())
+                        } else {
+                            (l_actual_schema.iter().position(|x| x == &col_b).unwrap(),
+                             right_schema.iter().position(|x| x == &col_a).unwrap())
+                        };
+                        
+                        let ldt = current_op.data_types();
+                        let rdt = right_op.data_types();
+
+                        current_op = if should_use_hash_join(&current_schema, &right_schema, ctx) {
+                            eprintln!("Join strategy: Grace Hash Join (Setting LRU cache)");
+                            buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::LRU);
+                            Box::new(HashJoinOp::new(current_op, right_op, l_idx, r_idx, ldt, rdt, buffer_pool))
+                        } else {
+                            eprintln!("Join strategy: Block Nested Loop Join (Setting MRU cache)");
+                            buffer_pool.set_eviction_policy(crate::buffer_pool::EvictionPolicy::MRU);
+                            Box::new(crate::join::JoinOp::new(current_op, right_op, l_idx, r_idx, rdt, buffer_pool))
+                        };
+                        
+                        current_schema.extend(right_schema);
+                        joined[leaf_idx] = true;
+                        remaining_preds.remove(pred_idx);
+                    } else {
                         // No join predicate found: do a cross product with next unjoined leaf
                         let leaf_idx = joined.iter().position(|&m| !m).unwrap();
                         let right_op = build_leaf_with_filter(
@@ -246,24 +243,26 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
 
             // Standard filter (no join rewrite)
             let preds: Vec<Predicate> = filter_data.predicates.iter().map(|p| clone_predicate(p)).collect();
-            let pushed = extract_pushed_predicate(&preds, ctx);
+            let pushed: Vec<Predicate> = preds.iter().filter(|p| {
+                !matches!(p.value, ComparisionValue::Column(_)) && matches!(p.operator, ComparisionOperator::EQ | ComparisionOperator::LT | ComparisionOperator::LTE | ComparisionOperator::GT | ComparisionOperator::GTE)
+            }).map(|p| clone_predicate(p)).collect();
             let child = build_operator_internal(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, pushed);
             Box::new(FilterOp::new(child, preds))
         }
 
         QueryOp::Project(project_data) => {
-            let child = build_operator_internal(&project_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, None);
+            let child = build_operator_internal(&project_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, Vec::new());
             Box::new(ProjectOp::new(child, project_data.column_name_map.clone()))
         }
 
         QueryOp::Cross(cross_data) => {
-            let left  = build_operator_internal(&cross_data.left,  ctx, buffer_pool, sort_memory_bytes, global_needed, None);
-            let right = build_operator_internal(&cross_data.right, ctx, buffer_pool, sort_memory_bytes, global_needed, None);
+            let left  = build_operator_internal(&cross_data.left,  ctx, buffer_pool, sort_memory_bytes, global_needed, Vec::new());
+            let right = build_operator_internal(&cross_data.right, ctx, buffer_pool, sort_memory_bytes, global_needed, Vec::new());
             Box::new(CrossOp::new(left, right, buffer_pool))
         }
 
         QueryOp::Sort(sort_data) => {
-            let child = build_operator_internal(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, None);
+            let child = build_operator_internal(&sort_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, Vec::new());
             let data_types = child.data_types();
             Box::new(SortOp::new(
                 child,
@@ -382,7 +381,9 @@ fn build_leaf_with_filter<R: Read + 'static, W: Write + 'static>(
     buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
 ) -> Box<dyn Operator<R, W>> {
-    let pushed = extract_pushed_predicate(scalar_preds, ctx);
+    let pushed: Vec<Predicate> = scalar_preds.iter().filter(|p| {
+        !matches!(p.value, ComparisionValue::Column(_)) && matches!(p.operator, ComparisionOperator::EQ | ComparisionOperator::LT | ComparisionOperator::LTE | ComparisionOperator::GT | ComparisionOperator::GTE)
+    }).map(|p| clone_predicate(p)).collect();
     let mut op = build_operator_internal(leaf, ctx, buffer_pool, sort_memory_bytes, global_needed, pushed);
 
     if !scalar_preds.is_empty() {
