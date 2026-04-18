@@ -87,11 +87,11 @@ fn partition_input<R: Read, W: Write>(
     let mut total_rows: Vec<usize> = vec![0; num_partitions];
 
     let block_size = buffer_pool.block_size();
-    // We have a 64 MB memory budget. Reserving ~15MB for 64 partition buffers
-    // means each bucket can hold ~240KB before flushing.
-    // 4000 rows per flush creates much larger contiguous disk allocation chunks
-    // and drastically reduces seek times from fragmentation.
-    let rows_per_flush = 4000;
+    // Drop this to 500. 
+    // 500 rows * 64 buckets = 32,000 concurrent rows (~6 MB max).
+    // This perfectly fits within our 64 MB RLIMIT_AS budget while still 
+    // chunking enough to prevent severe disk fragmentation.
+    let rows_per_flush = 500;
 
     while let Some(row) = input.next(buffer_pool) {
         let h = hash_data(&row.values[join_col_idx]);
