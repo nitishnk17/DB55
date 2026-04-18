@@ -274,12 +274,22 @@ fn clone_cmp_value(v: &ComparisionValue) -> ComparisionValue {
 ///   • If either side has cardinality > threshold → Hash Join (handles large tables)
 ///   • If both sides are tiny (≤ threshold)       → BNLJ   (lower constant factor)
 ///   • If stats are unavailable                   → Hash Join (safe default)
-fn should_use_hash_join(_left_schema: &[String], _right_schema: &[String], _ctx: &DbContext) -> bool {
-    // ALWAYS return true.
-    // The pure in-memory BNLJ is too risky with the 64MB RLIMIT_AS limit 
-    // because statistical cardinality estimates can be wildly inaccurate. 
-    // Grace Hash Join safely spills to disk and handles relations of any size.
-    true
+fn should_use_hash_join(left_schema: &[String], right_schema: &[String], ctx: &DbContext) -> bool {
+    let threshold = 1_000u64;
+
+    let left_card  = estimate_cardinality(left_schema, ctx);
+    let right_card = estimate_cardinality(right_schema, ctx);
+
+    match (left_card, right_card) {
+        (Some(l), Some(r)) => {
+            eprintln!("Join heuristic: left_card={}, right_card={}, threshold={}", l, r, threshold);
+            l > threshold || r > threshold
+        }
+        _ => {
+            eprintln!("Join heuristic: no cardinality stats, defaulting to Hash Join");
+            true
+        }
+    }
 }
 
 /// Recursively scan AST to extract every column name that upper levels depend on
