@@ -26,19 +26,34 @@ pub fn build_operator<R: Read + 'static, W: Write + 'static>(
     build_operator_internal(query_op, ctx, buffer_pool, sort_memory_bytes, &global_needed, None)
 }
 
-fn extract_pushed_predicate(preds: &[Predicate]) -> Option<Predicate> {
+fn extract_pushed_predicate(preds: &[Predicate], ctx: &DbContext) -> Option<Predicate> {
+    let mut fallback = None;
     for p in preds {
         if !matches!(p.value, ComparisionValue::Column(_)) {
             match p.operator {
                 ComparisionOperator::EQ | ComparisionOperator::LT | ComparisionOperator::LTE |
                 ComparisionOperator::GT | ComparisionOperator::GTE => {
-                    return Some(clone_predicate(p));
+                    if fallback.is_none() {
+                        fallback = Some(clone_predicate(p));
+                    }
+
+                    for table in ctx.get_table_specs() {
+                        for cs in &table.column_specs {
+                            if cs.column_name == p.column_name {
+                                if let Some(stats) = &cs.stats {
+                                    if stats.iter().any(|s| matches!(s, ColumnStat::IsPhysicallyOrdered)) {
+                                        return Some(clone_predicate(p));
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
                 _ => {}
             }
         }
     }
-    None
+    fallback
 }
 
 fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
@@ -231,7 +246,7 @@ fn build_operator_internal<R: Read + 'static, W: Write + 'static>(
 
             // Standard filter (no join rewrite)
             let preds: Vec<Predicate> = filter_data.predicates.iter().map(|p| clone_predicate(p)).collect();
-            let pushed = extract_pushed_predicate(&preds);
+            let pushed = extract_pushed_predicate(&preds, ctx);
             let child = build_operator_internal(&filter_data.underlying, ctx, buffer_pool, sort_memory_bytes, global_needed, pushed);
             Box::new(FilterOp::new(child, preds))
         }
@@ -367,7 +382,7 @@ fn build_leaf_with_filter<R: Read + 'static, W: Write + 'static>(
     buffer_pool: &mut BufferPool<R, W>,
     sort_memory_bytes: usize,
 ) -> Box<dyn Operator<R, W>> {
-    let pushed = extract_pushed_predicate(scalar_preds);
+    let pushed = extract_pushed_predicate(scalar_preds, ctx);
     let mut op = build_operator_internal(leaf, ctx, buffer_pool, sort_memory_bytes, global_needed, pushed);
 
     if !scalar_preds.is_empty() {
